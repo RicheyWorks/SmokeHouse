@@ -25,7 +25,7 @@ class SegmentLogTest {
 
     @Test
     void appendsRollAndPositionalReadsHit(@TempDir Path dir) throws IOException {
-        try (SegmentLog log = SegmentLog.open(dir, 1024, Fsync.OS)) {   // tiny segments: force rolls
+        try (SegmentLog log = SegmentLog.open(dir, 1024, Fsync.OS, 50)) {   // tiny segments: force rolls
             List<SegmentLog.Location> locs = new ArrayList<>();
             for (int i = 0; i < 100; i++) {
                 locs.add(log.append(rec("key-" + i, "value-" + i + "-padding-padding-padding")));
@@ -40,12 +40,12 @@ class SegmentLogTest {
 
     @Test
     void scanVisitsEverythingInOrderAcrossReopen(@TempDir Path dir) throws IOException {
-        try (SegmentLog log = SegmentLog.open(dir, 512, Fsync.OS)) {
+        try (SegmentLog log = SegmentLog.open(dir, 512, Fsync.OS, 50)) {
             for (int i = 0; i < 40; i++) {
                 log.append(rec("k" + i, "v" + i));
             }
         }
-        try (SegmentLog reopened = SegmentLog.open(dir, 512, Fsync.OS)) {
+        try (SegmentLog reopened = SegmentLog.open(dir, 512, Fsync.OS, 50)) {
             List<String> seen = new ArrayList<>();
             reopened.scan((seg, off, r) -> seen.add(new String(r.key(), StandardCharsets.UTF_8)));
             assertEquals(40, seen.size());
@@ -57,7 +57,7 @@ class SegmentLogTest {
     @Test
     void crashTailIsTruncatedNotFatal(@TempDir Path dir) throws IOException {
         Path victim;
-        try (SegmentLog log = SegmentLog.open(dir, 1 << 20, Fsync.ALWAYS)) {
+        try (SegmentLog log = SegmentLog.open(dir, 1 << 20, Fsync.ALWAYS, 50)) {
             for (int i = 0; i < 10; i++) {
                 log.append(rec("k" + i, "v" + i));
             }
@@ -66,7 +66,7 @@ class SegmentLogTest {
         // Simulate a crash mid-append: garbage bytes on the tail of the newest segment.
         Files.write(victim, new byte[]{7, 7, 7, 7, 7, 7, 7}, StandardOpenOption.APPEND);
 
-        try (SegmentLog reopened = SegmentLog.open(dir, 1 << 20, Fsync.OS)) {
+        try (SegmentLog reopened = SegmentLog.open(dir, 1 << 20, Fsync.OS, 50)) {
             List<String> seen = new ArrayList<>();
             reopened.scan((seg, off, r) -> seen.add(new String(r.key(), StandardCharsets.UTF_8)));
             assertEquals(10, seen.size(), "everything before the tear survives; the tear is dropped");

@@ -2,8 +2,8 @@ package io.github.richeyworks.smokehouse;
 
 /**
  * Durability dial for the segment log (ADR D3: the log IS the WAL — this is the only fsync that
- * exists). Phase 1 ships the two ends of the dial; the grouped {@code INTERVAL(ms)} middle —
- * the planned default — is Phase 2.
+ * exists). None of these can corrupt the store — a torn tail is truncated by CRC at recovery;
+ * the dial only chooses how many <em>acknowledged</em> recent appends a power loss may cost.
  */
 public enum Fsync {
 
@@ -11,8 +11,11 @@ public enum Fsync {
     ALWAYS,
 
     /**
-     * Let the OS page cache decide: fastest; a crash loses recently-acknowledged appends
-     * (never corrupts — a torn tail is truncated by CRC at recovery).
+     * Group fsync on a daemon every {@code fsyncIntervalMillis} (option; default 50 ms): the
+     * honest middle — bounded loss window, near-OS throughput. <b>The default.</b>
      */
+    INTERVAL,
+
+    /** Let the OS page cache decide: fastest; a crash loses recently-acknowledged appends. */
     OS
 }

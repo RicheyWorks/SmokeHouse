@@ -26,9 +26,21 @@ The index is **adaptive by default**: CSRBT's control plane watches your access 
 read/write mix, real key skew) and re-shapes the index through anti-thrash gates, driven by an
 internal pilot — no tuning, no human. `IndexTier.STATIC` opts out.
 
+**Phase 2 (durability + reclamation):** `Fsync.INTERVAL` group durability is the default (a
+50 ms bounded loss window; `ALWAYS` and `OS` are the ends of the dial). Clean shutdowns write a
+CRC-guarded **hint checkpoint**, so reopening scans only the delta — and a corrupt or stale hint
+is simply ignored (truth never depends on it). `compact()` merges all closed segments into one
+key-ordered segment containing exactly the live records, crash-safe via a marker protocol
+(interrupted commits replay or roll back on the next open) — dropped tombstones can never
+resurrect anything because compaction always covers a full prefix of the log.
+`retainNewest(n)` is the retention tier: keep only the newest-written N keys, evictions funding
+the per-segment garbage ledger with no tombstones needed (recovery re-derives newest-N from log
+order, which *is* write order).
+
 **Honest bounds** (see the ADR): all keys live in memory (the Bitcask trade — this is an
 embedded store for key-indexed records, not a general database); key `equals` must agree with
-the comparator; Phase 1 has no compaction yet, so overwritten/deleted bytes stay on disk.
+the comparator; compaction is manual (`compact()`) — auto-triggering off the garbage ledger is
+Phase 4 dashboard territory.
 
 ## Build
 
