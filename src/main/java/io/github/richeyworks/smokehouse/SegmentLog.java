@@ -94,7 +94,14 @@ final class SegmentLog implements Closeable {
 
     /**
      * Idempotent replay/rollback of an interrupted compaction commit (see class javadoc).
-     * Runs before any segment listing on every open.
+     * Runs before any segment listing on every open. Case analysis, by what the crash left:
+     * no marker → the attempt never committed, discard the scratch; a torn marker → ditto (the
+     * marker is forced before any original is deleted, so a torn one proves no delete happened);
+     * marker + scratch → the scratch is a complete superset of the covered range, finish the
+     * deletes and the rename; marker but <b>no</b> scratch → the rename itself already happened,
+     * so {@code seg-maxId} IS the merged replacement and must be kept — only the lower originals
+     * (already gone or safe to drop) are cleared. Deleting {@code seg-maxId} in that last case
+     * would destroy every live record the compaction preserved.
      */
     static void finishPendingCompaction(Path dir) throws IOException {
         Path tmp = dir.resolve(COMPACT_TMP);
@@ -103,15 +110,27 @@ final class SegmentLog implements Closeable {
             Files.deleteIfExists(tmp);                    // never committed: discard
             return;
         }
-        String[] range = Files.readString(ready, StandardCharsets.UTF_8).trim().split(" ");
-        int minId = Integer.parseInt(range[0]);
-        int maxId = Integer.parseInt(range[1]);
-        for (int id = minId; id <= maxId; id++) {
-            Files.deleteIfExists(dir.resolve(segmentName(id)));
+        int minId;
+        int maxId;
+        try {
+            String[] range = Files.readString(ready, StandardCharsets.UTF_8).trim().split(" ");
+            minId = Integer.parseInt(range[0]);
+            maxId = Integer.parseInt(range[1]);
+        } catch (RuntimeException tornMarker) {
+            // Crash inside the marker write, before its force returned. Deletes only begin
+            // after that force, so every original is intact: the attempt never committed.
+            Files.deleteIfExists(tmp);
+            Files.deleteIfExists(ready);
+            return;
+        }
+        for (int id = minId; id < maxId; id++) {          // maxId handled below — it may already
+            Files.deleteIfExists(dir.resolve(segmentName(id)));   // BE the merged replacement
         }
         if (Files.exists(tmp)) {                          // crash before the rename: finish it
+            Files.deleteIfExists(dir.resolve(segmentName(maxId)));   // the pre-compaction original
             Files.move(tmp, dir.resolve(segmentName(maxId)), StandardCopyOption.ATOMIC_MOVE);
         }
+        // No tmp: the rename already committed, seg-maxId is the merged segment — keep it.
         Files.deleteIfExists(dir.resolve(HINT_FILE));     // hint locations reference the old files
         Files.deleteIfExists(ready);
     }
