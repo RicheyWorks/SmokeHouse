@@ -1,6 +1,7 @@
 plugins {
     `java-library`
     application
+    alias(libs.plugins.jmh)
 }
 
 // The shop window (Phase 4.4): `./gradlew run` starts the store dashboard on 127.0.0.1:8079.
@@ -36,4 +37,21 @@ tasks.test {
     systemProperty("log4j2.loggerContextFactory",
             "org.apache.logging.log4j.simple.SimpleLoggerContextFactory")
     systemProperty("org.apache.logging.log4j.simplelog.StatusLogger.level", "OFF")
+}
+
+// Phase 5 (measure): the SmokeHouse JMH rig, mirroring csrbt-benchmarks. A src/jmh/java source set
+// (not a separate module — SmokeHouse is single-module). Never published.
+//   ./gradlew compileJmhJava   compile the benchmarks only (fast check)
+//   ./gradlew jmh              run them all (results at build/reports/jmh/results.json)
+// Narrow a run by uncommenting `includes` below (regex over fully-qualified benchmark names).
+val jmhVer = libs.versions.jmh.asProvider().get()
+
+jmh {
+    jmhVersion = jmhVer
+    fork = 1
+    warmupIterations = 3
+    iterations = 5
+    resultFormat = "JSON"
+    resultsFile = layout.buildDirectory.file("reports/jmh/results.json")
+    // includes = listOf("StoreOpsBenchmark.upsert")
 }

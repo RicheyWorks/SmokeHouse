@@ -1,8 +1,13 @@
 # Matched to the siblings' catalogs (CSRBT / SuperBeefSort) so the ecosystem shares one test stack.
 [versions]
 junit = "5.14.4"
+jmh = "1.37"                # Phase 5: JMH core, matching csrbt-benchmarks
+jmh-plugin = "0.7.3"        # me.champeau.jmh Gradle plugin
 
 [libraries]
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+
+[plugins]
+jmh = { id = "me.champeau.jmh", version.ref = "jmh-plugin" }
