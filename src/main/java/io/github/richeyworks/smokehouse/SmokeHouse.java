@@ -903,6 +903,56 @@ public final class SmokeHouse<K, V> implements Closeable {
         return tailStream.nextSequence();
     }
 
+    /**
+     * Watch a single key (Phase 7): the returned handle streams every committed mutation of
+     * {@code key} — each put and the delete — as {@link TailEvent}s from now on, delivered off the
+     * store lock. It is a filtered view of the {@link #tail}; close the handle to stop. Future
+     * changes only — call {@link #get} first if you need the current value.
+     */
+    public AutoCloseable watch(K key, TailListener<K, V> listener) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(listener, "listener");
+        var cmp = opts.comparator();
+        return tailStream.subscribe(tailStream.nextSequence(), new TailListener<K, V>() {
+            @Override
+            public void onEvent(TailEvent<K, V> event) {
+                if (cmp.compare(key, event.key()) == 0) {
+                    listener.onEvent(event);
+                }
+            }
+
+            @Override
+            public void onGap() {
+                listener.onGap();
+            }
+        });
+    }
+
+    /**
+     * Watch a key range {@code [lo, hi]} (both inclusive, by the store's comparator): every
+     * committed mutation of an in-range key streams to {@code listener} from now on, off the store
+     * lock. A filtered view of the {@link #tail}; close the handle to stop.
+     */
+    public AutoCloseable watchRange(K lo, K hi, TailListener<K, V> listener) {
+        Objects.requireNonNull(lo, "lo");
+        Objects.requireNonNull(hi, "hi");
+        Objects.requireNonNull(listener, "listener");
+        var cmp = opts.comparator();
+        return tailStream.subscribe(tailStream.nextSequence(), new TailListener<K, V>() {
+            @Override
+            public void onEvent(TailEvent<K, V> event) {
+                if (cmp.compare(lo, event.key()) <= 0 && cmp.compare(event.key(), hi) <= 0) {
+                    listener.onEvent(event);
+                }
+            }
+
+            @Override
+            public void onGap() {
+                listener.onGap();
+            }
+        });
+    }
+
     /** A one-line health/shape summary, including the control plane's own report. */
     public String stats() {
         try {
