@@ -107,6 +107,32 @@ class Phase2Test {
     }
 
     @Test
+    void warmRecoveryHandlesMoreThanSixtyFourKKeys(@TempDir Path dir) throws IOException {
+        // Regression (found by the JMH RecoveryBenchmark): recovery deduped into a HashMap, and the
+        // warm-start-no-delta path built the index straight from live.values() without re-sorting.
+        // HashMap iteration is only accidentally ascending below 2^16 keys; above it the h^(h>>>16)
+        // spread swaps adjacent buckets, so fromSorted threw "not strictly ascending" at ~index
+        // 65537. Populate past the boundary, close clean (writes a hint), and reopen warm.
+        int keys = 70_000;                                   // > 65536
+        SmokeHouseOptions<Long, String> big = SmokeHouseOptions
+                .of(SpillSerializer.forLongs(), SpillSerializer.forStrings())
+                .indexTier(SmokeHouseOptions.IndexTier.STATIC);   // default 64 MB segments: few files
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, big)) {
+            for (long k = 0; k < keys; k++) {
+                store.put(k, "v" + k);
+            }
+        }   // clean close writes a hint → the reopen is the warm, no-delta path that used to throw
+        try (SmokeHouse<Long, String> reopened = SmokeHouse.open(dir, big)) {
+            assertEquals(keys, reopened.size());
+            assertEquals(0L, (long) reopened.firstKey());
+            assertEquals(keys - 1L, (long) reopened.lastKey());
+            assertEquals("v0", reopened.get(0L));
+            assertEquals("v65537", reopened.get(65_537L));   // the boundary key that used to misorder
+            assertEquals("v" + (keys - 1), reopened.get(keys - 1L));
+        }
+    }
+
+    @Test
     void compactionReclaimsWithoutChangingTruth(@TempDir Path dir) throws IOException {
         TreeMap<Long, String> oracle;
         try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {

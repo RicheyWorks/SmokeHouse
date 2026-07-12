@@ -37,6 +37,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.concurrent.Executors;
@@ -273,7 +274,11 @@ public final class SmokeHouse<K, V> implements Closeable {
         // ── Recovery: (hint checkpoint +) delta scan → last-writer-wins → sort → O(n) build ──
         HintFile.KeyCodec<K> codec = keyCodec(opts);
         HintFile.Hint<K> hint = HintFile.load(log.hintPath(), codec, opts.comparator(), log);
-        Map<K, IndexEntry<K>> live = new HashMap<>();
+        // TreeMap, not HashMap: the warm-start-no-delta path below skips the SuperBeefSort re-sort
+        // and builds the index straight from live.values(), so that iteration MUST be key-sorted.
+        // HashMap order is only accidentally ascending below 2^16 keys — the h ^ (h >>> 16) spread
+        // perturbs bucket order above it, so fromSorted saw an unsorted list and threw.
+        Map<K, IndexEntry<K>> live = new TreeMap<>(opts.comparator());
         Map<Integer, Long> recoveredGarbage = new HashMap<>();
         boolean[] delta = {false};
         int scanFloor = Integer.MIN_VALUE;
