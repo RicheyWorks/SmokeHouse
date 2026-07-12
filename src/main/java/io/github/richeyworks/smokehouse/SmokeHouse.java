@@ -126,6 +126,7 @@ public final class SmokeHouse<K, V> implements Closeable {
     private final Tail<K, V> tailStream = new Tail<>(TAIL_RING_CAPACITY);   // Phase 7: committed-mutation stream
     private volatile String pilotVerdict = "not yet evaluated";
     private volatile boolean compacting;                           // single-compaction guard: serializes compact()
+    private int openSnapshots;                                     // snapshots pinning the segment set (store-lock guarded)
     private long puts, gets, deletes;
     private int pilotCycles;
     private boolean evolutionCycleOpen;                            // pilot-only (store lock)
@@ -711,8 +712,8 @@ public final class SmokeHouse<K, V> implements Closeable {
         int minId;
         int maxId;
         synchronized (lock) {
-            if (compacting) {
-                return 0;                                            // a compaction is already in flight
+            if (compacting || openSnapshots > 0) {
+                return 0;                                            // already compacting, or a snapshot pins the segments
             }
             List<Integer> closed = log.closedSegmentIds();
             if (closed.isEmpty()) {
@@ -951,6 +952,102 @@ public final class SmokeHouse<K, V> implements Closeable {
                 listener.onGap();
             }
         });
+    }
+
+    /**
+     * A consistent point-in-time read view (Phase 7): an O(n) frozen clone of the current index over
+     * the immutable segment set. Reads on it never block the writer and never see later mutations —
+     * an overwrite appends a new record, and the snapshot keeps reading the old one. While any
+     * snapshot is open, {@link #compact()} is deferred so its segments are never reclaimed out from
+     * under it (v1 pins coarsely — the whole set; per-generation refcounts are the refinement).
+     * Honest bound: an O(n) index copy at creation, and deferred compaction while open — this is an
+     * embedded store, not MVCC. Close the snapshot to release.
+     */
+    public Snapshot snapshot() {
+        synchronized (lock) {
+            List<IndexEntry<K>> frozen = new ArrayList<>(indexInOrder());
+            openSnapshots++;
+            return new Snapshot(frozen);
+        }
+    }
+
+    /** A frozen, isolated read view over the segment set as of {@link #snapshot()} — see there. */
+    public final class Snapshot implements AutoCloseable {
+        private final List<IndexEntry<K>> frozen;                 // sorted by key; immutable for the snapshot's life
+        private boolean open = true;
+
+        private Snapshot(List<IndexEntry<K>> frozen) {
+            this.frozen = frozen;
+        }
+
+        /** Live keys as of the snapshot. */
+        public int size() {
+            return frozen.size();
+        }
+
+        /** The value for {@code key} as of the snapshot, or {@code null}. */
+        public V get(K key) throws IOException {
+            int i = lowerBound(key);
+            if (i < frozen.size() && opts.comparator().compare(frozen.get(i).key(), key) == 0) {
+                return readValueAt(frozen.get(i));
+            }
+            return null;
+        }
+
+        /** Visit every {@code lo <= key <= hi} in key order, as of the snapshot. */
+        public void range(K lo, K hi, BiConsumer<K, V> consumer) throws IOException {
+            var cmp = opts.comparator();
+            for (int i = lowerBound(lo); i < frozen.size(); i++) {
+                IndexEntry<K> e = frozen.get(i);
+                if (cmp.compare(e.key(), hi) > 0) {
+                    break;
+                }
+                consumer.accept(e.key(), readValueAt(e));
+            }
+        }
+
+        public K firstKey() {
+            return frozen.isEmpty() ? null : frozen.get(0).key();
+        }
+
+        public K lastKey() {
+            return frozen.isEmpty() ? null : frozen.get(frozen.size() - 1).key();
+        }
+
+        /** First index whose key is >= {@code lo} — binary search over the frozen, key-sorted entries. */
+        private int lowerBound(K lo) {
+            var cmp = opts.comparator();
+            int lo0 = 0;
+            int hi0 = frozen.size();
+            while (lo0 < hi0) {
+                int mid = (lo0 + hi0) >>> 1;
+                if (cmp.compare(frozen.get(mid).key(), lo) < 0) {
+                    lo0 = mid + 1;
+                } else {
+                    hi0 = mid;
+                }
+            }
+            return lo0;
+        }
+
+        private V readValueAt(IndexEntry<K> e) throws IOException {
+            RecordCodec.Rec rec = log.read(e.location());
+            if (rec == null || rec.isTorn() || rec.tombstone()) {
+                throw new IOException("snapshot pointed at an unreadable record at " + e.location());
+            }
+            return readValue(rec.value());
+        }
+
+        /** Release the pin, letting compaction reclaim again. Idempotent. */
+        @Override
+        public void close() {
+            synchronized (lock) {
+                if (open) {
+                    open = false;
+                    openSnapshots--;
+                }
+            }
+        }
     }
 
     /** A one-line health/shape summary, including the control plane's own report. */
