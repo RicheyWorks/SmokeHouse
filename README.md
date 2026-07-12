@@ -161,19 +161,23 @@ regimes (steady churn, hot-key overwrite, read-heavy, delete wave) while the pag
 Server-Sent Events — keys/puts/gets/deletes ticking, the pilot's verdicts as they change, and
 the **segment map**: one bar per log segment, its red fill the garbage ledger made visible.
 Press *Compact now* and watch the map squash to a handful of clean segments while the workload
-keeps running (compaction's copy phase is off the store lock by design). Binds loopback only —
-an exhibit, not a service.
+keeps running (compaction's copy phase is off the store lock by design) — *hot-key-overwrite* is
+the garbage machine if you want the squash to be dramatic. Regime buttons switch the workload
+live; *Pause* freezes it mid-scene. Binds loopback only — an exhibit, not a service.
 
 ## Design
 
 The full architecture — why Bitcask-style beat LSM here, the `IndexEntry` trick that turns a
-set into a map through public API only, the compaction crash windows, and the roadmap
-(Phase 3 ✓: file ingestion + trace replay — `importInto` here, the `RecordSource` trio and trace
-record/replay in SuperBeefSort; Phase 4 in flight: ensemble + evolution index tiers ✓, the
-CSRBT full-extent unlock ✓ — born-optimal builds, profile-guided adaptation, order statistics —
-auto-compaction ✓, `IndexedStore` secondaries ✓, the interval index ✓, and the store
-dashboard ✓) — lives in the ecosystem ADR:
+set into a map through public API only, the compaction crash windows, and every trade-off above
+— lives in the ecosystem ADR:
 [`SuperBeefSort/docs/adr-smokehouse-ecosystem-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-smokehouse-ecosystem-ring.md).
+Its four phases (core store, durability + compaction, ingestion, the index ring + dashboard) are
+all complete.
+
+What comes next — benchmarking and the measured performance seams, crash-fuzz hardening,
+backup/restore, a log-tail primitive feeding watchers and snapshots, tail-shipped read replicas,
+and Maven Central release — is the successor ADR:
+[`SuperBeefSort/docs/adr-ecosystem-outer-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-ecosystem-outer-ring.md).
 
 ## License
 
