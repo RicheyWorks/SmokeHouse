@@ -332,10 +332,20 @@ final class SegmentLog implements Closeable {
     @Override
     public void close() throws IOException {
         if (fsyncDaemon != null) {
-            fsyncDaemon.shutdownNow();
+            fsyncDaemon.shutdown();                        // let an in-flight force() finish...
+            try {
+                if (!fsyncDaemon.awaitTermination(5, TimeUnit.SECONDS)) {
+                    fsyncDaemon.shutdownNow();             // ...only interrupt a daemon that overran
+                }
+            } catch (InterruptedException interrupted) {
+                fsyncDaemon.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
         synchronized (this) {
-            active.force(false);
+            if (active.isOpen()) {                         // an interrupted force() may have closed it
+                active.force(false);
+            }
             active.close();
         }
         for (FileChannel ch : readers.values()) {
