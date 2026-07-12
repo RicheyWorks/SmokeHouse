@@ -7,8 +7,15 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -139,6 +146,68 @@ class Phase2Test {
         try (SmokeHouse<Long, String> reopened = SmokeHouse.open(dir, opts())) {
             assertFalse(Files.exists(dir.resolve(SegmentLog.COMPACT_TMP)), "scratch discarded");
             assertAgrees(reopened, oracle);
+        }
+    }
+
+    @Test
+    void compactionSurvivesCrashAfterRenameBeforeMarkerCleared(@TempDir Path dir) throws IOException {
+        // The dangerous window: a crash AFTER the merged segment is renamed into place but BEFORE
+        // the COMPACT_READY marker is cleared. On reopen the marker is present and the scratch is
+        // gone, so seg-maxId already IS the merged replacement and must be kept — deleting it would
+        // lose every compacted record. Regression guard for the finishPendingCompaction fix.
+        TreeMap<Long, String> oracle;
+        int minId;
+        int maxId;
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            oracle = churn(store, 9L, 4_000);                     // small segments → many closed ones
+            var closed = store.segmentStats().stream()
+                    .filter(s -> !s.active())
+                    .map(SmokeHouse.SegmentStat::segmentId)
+                    .sorted()
+                    .toList();
+            assertFalse(closed.isEmpty(), "need closed segments to compact");
+            minId = closed.get(0);
+            maxId = closed.get(closed.size() - 1);                // becomes the merged segment id
+            assertTrue(store.compact() > 0, "compaction must reclaim something");
+            assertAgrees(store, oracle);
+        }
+        // Reconstruct the post-rename, pre-marker-clear state: merged seg-maxId on disk (a clean
+        // compaction leaves it), no scratch, and the READY marker still present.
+        Files.deleteIfExists(dir.resolve(SegmentLog.COMPACT_TMP));
+        Files.writeString(dir.resolve(SegmentLog.COMPACT_READY), minId + " " + maxId);
+        try (SmokeHouse<Long, String> reopened = SmokeHouse.open(dir, opts())) {
+            assertAgrees(reopened, oracle);                       // must NOT have deleted the merged segment
+        }
+    }
+
+    @Test
+    void concurrentCompactionsDoNotCorruptTheStore(@TempDir Path dir) throws Exception {
+        // Two compactions must never run at once: unguarded, they race on the single scratch file
+        // and double-repoint the index. The guard makes overlapping calls serialize (losers no-op).
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir, opts())) {
+            TreeMap<Long, String> oracle = churn(store, 13L, 4_000);
+            assertTrue(store.garbageBytes() > 0, "churn must leave dead bytes to reclaim");
+
+            int threads = 4;
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch startLine = new CountDownLatch(1);
+            List<Future<Long>> results = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                results.add(pool.submit(() -> {
+                    startLine.await();                            // release all threads together
+                    return store.compact();
+                }));
+            }
+            startLine.countDown();
+            long totalReclaimed = 0;
+            for (Future<Long> f : results) {
+                totalReclaimed += f.get();                        // rethrows any compaction failure
+            }
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+
+            assertTrue(totalReclaimed >= 0);
+            assertAgrees(store, oracle);                          // consistent regardless of who won
         }
     }
 
