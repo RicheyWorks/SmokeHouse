@@ -119,7 +119,7 @@ public final class SmokeHouse<K, V> implements Closeable {
     private final ScheduledExecutorService pilot;                  // null in STATIC tier
     private final Map<Integer, Long> garbage = new HashMap<>();    // segmentId -> dead bytes; store-lock guarded
     private volatile String pilotVerdict = "not yet evaluated";
-    private volatile boolean compacting;                           // auto-compaction re-entry guard
+    private volatile boolean compacting;                           // single-compaction guard: serializes compact()
     private long puts, gets, deletes;
     private int pilotCycles;
     private boolean evolutionCycleOpen;                            // pilot-only (store lock)
@@ -247,15 +247,12 @@ public final class SmokeHouse<K, V> implements Closeable {
                 pilotVerdict = pilotVerdict + "; auto-compaction skipped (" + unreadable.getMessage() + ")";
                 return;
             }
-            compacting = true;
         }
         try {
-            long reclaimed = compact();
+            long reclaimed = compact();                              // compact() self-guards against concurrency
             pilotVerdict = pilotVerdict + "; auto-compacted " + reclaimed + " bytes";
         } catch (IOException failed) {
             pilotVerdict = pilotVerdict + "; auto-compaction failed (" + failed.getMessage() + ")";
-        } finally {
-            compacting = false;
         }
     }
 
@@ -702,6 +699,9 @@ public final class SmokeHouse<K, V> implements Closeable {
         int minId;
         int maxId;
         synchronized (lock) {
+            if (compacting) {
+                return 0;                                            // a compaction is already in flight
+            }
             List<Integer> closed = log.closedSegmentIds();
             if (closed.isEmpty()) {
                 return 0;
@@ -713,53 +713,57 @@ public final class SmokeHouse<K, V> implements Closeable {
                     victims.add(e);
                 }
             }
+            compacting = true;                                       // serialize compactions across the off-lock copy
         }
+        try {
+            // Copy phase, lock-free: rewrite the live records, key-ordered, into the scratch file.
+            List<IndexEntry<K>> replacements = new ArrayList<>(victims.size());
+            long newOffset = 0;
+            try (FileChannel tmp = log.openCompactionTmp()) {
+                for (IndexEntry<K> v : victims) {
+                    RecordCodec.Rec rec = log.read(v.location());
+                    if (rec == null || rec.isTorn() || rec.tombstone()) {
+                        throw new IOException("compaction could not read live record at " + v.location());
+                    }
+                    byte[] encoded = RecordCodec.encode(rec.key(), rec.value(), false);
+                    ByteBuffer buf = ByteBuffer.wrap(encoded);
+                    while (buf.hasRemaining()) {
+                        tmp.write(buf);
+                    }
+                    replacements.add(new IndexEntry<>(v.key(), maxId, newOffset, encoded.length));
+                    newOffset += encoded.length;
+                }
+                tmp.force(true);
+            }
 
-        // Copy phase, lock-free: rewrite the live records, key-ordered, into the scratch file.
-        List<IndexEntry<K>> replacements = new ArrayList<>(victims.size());
-        long newOffset = 0;
-        try (FileChannel tmp = log.openCompactionTmp()) {
-            for (IndexEntry<K> v : victims) {
-                RecordCodec.Rec rec = log.read(v.location());
-                if (rec == null || rec.isTorn() || rec.tombstone()) {
-                    throw new IOException("compaction could not read live record at " + v.location());
+            synchronized (lock) {
+                long beforeBytes = 0;
+                for (int id = minId; id <= maxId; id++) {
+                    beforeBytes += log.segmentSize(id);
                 }
-                byte[] encoded = RecordCodec.encode(rec.key(), rec.value(), false);
-                ByteBuffer buf = ByteBuffer.wrap(encoded);
-                while (buf.hasRemaining()) {
-                    tmp.write(buf);
+                log.commitCompaction(minId, maxId);                       // marker → delete → rename
+                for (int id = minId; id <= maxId; id++) {
+                    garbage.remove(id);                                   // those files are gone
                 }
-                replacements.add(new IndexEntry<>(v.key(), maxId, newOffset, encoded.length));
-                newOffset += encoded.length;
-            }
-            tmp.force(true);
-        }
-
-        synchronized (lock) {
-            long beforeBytes = 0;
-            for (int id = minId; id <= maxId; id++) {
-                beforeBytes += log.segmentSize(id);
-            }
-            log.commitCompaction(minId, maxId);                       // marker → delete → rename
-            for (int id = minId; id <= maxId; id++) {
-                garbage.remove(id);                                   // those files are gone
-            }
-            for (int i = 0; i < victims.size(); i++) {
-                IndexEntry<K> victim = victims.get(i);
-                IndexEntry<K> current = liveEntry(victim.key());
-                if (current != null && current.sameLocation(victim)) {
-                    // Repoint: same key, new address. Deliberately NOT recorded in the workload
-                    // monitor — compaction is maintenance, not traffic; recording it would skew
-                    // the pilot's read/write mix with our own housekeeping.
-                    maintenanceRemove(victim);
-                    maintenanceAdd(replacements.get(i));
-                } else {
-                    // The workload overwrote/deleted/evicted this key mid-copy: our fresh copy
-                    // is dead on arrival — honest garbage in the merged segment.
-                    addGarbage(maxId, replacements.get(i).recordBytes());
+                for (int i = 0; i < victims.size(); i++) {
+                    IndexEntry<K> victim = victims.get(i);
+                    IndexEntry<K> current = liveEntry(victim.key());
+                    if (current != null && current.sameLocation(victim)) {
+                        // Repoint: same key, new address. Deliberately NOT recorded in the workload
+                        // monitor — compaction is maintenance, not traffic; recording it would skew
+                        // the pilot's read/write mix with our own housekeeping.
+                        maintenanceRemove(victim);
+                        maintenanceAdd(replacements.get(i));
+                    } else {
+                        // The workload overwrote/deleted/evicted this key mid-copy: our fresh copy
+                        // is dead on arrival — honest garbage in the merged segment.
+                        addGarbage(maxId, replacements.get(i).recordBytes());
+                    }
                 }
+                return beforeBytes - newOffset;
             }
-            return beforeBytes - newOffset;
+        } finally {
+            compacting = false;
         }
     }
 
