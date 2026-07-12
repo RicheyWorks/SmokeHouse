@@ -1,5 +1,11 @@
 plugins {
     `java-library`
+    application
+}
+
+// The shop window (Phase 4.4): `./gradlew run` starts the store dashboard on 127.0.0.1:8079.
+application {
+    mainClass.set("io.github.richeyworks.smokehouse.demo.StoreDashboard")
 }
 
 group = "io.github.richeyworks"

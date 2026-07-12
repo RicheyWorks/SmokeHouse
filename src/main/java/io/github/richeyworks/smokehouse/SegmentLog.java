@@ -120,6 +120,20 @@ final class SegmentLog implements Closeable {
         return String.format("seg-%08d.log", id);
     }
 
+    /**
+     * Whether {@code dir} already holds any segment file. The {@code importInto} guard reads this
+     * <em>before</em> opening a log (an {@link #open} always creates a fresh active segment, so it
+     * could not tell a fresh directory from a populated one). A non-existent directory has none.
+     */
+    static boolean hasSegments(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) {
+            return false;
+        }
+        try (var stream = Files.list(dir)) {
+            return stream.anyMatch(p -> SEGMENT_NAME.matcher(p.getFileName().toString()).matches());
+        }
+    }
+
     /** Existing segment ids on disk, ascending (includes the active one once created). */
     List<Integer> segmentIds() throws IOException {
         List<Integer> ids = new ArrayList<>();

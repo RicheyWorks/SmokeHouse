@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SmokeHouse — the shop window</title>
+<style>
+  :root { --bg:#12100e; --panel:#1c1916; --ink:#e8e0d4; --dim:#8d8477; --live:#7cb46b;
+          --garbage:#c25b4e; --active:#e0a458; --line:#2c2823; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { padding:14px 20px 8px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:17px; font-weight:600; letter-spacing:.4px; }
+  h1 small { color:var(--dim); font-weight:400; margin-left:10px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; padding:12px 20px; }
+  .chip { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:8px 14px; min-width:110px; }
+  .chip b { display:block; font-size:19px; font-weight:600; }
+  .chip span { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.8px; }
+  section { padding:4px 20px 12px; }
+  section h2 { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:1px;
+               margin:10px 0 8px; }
+  #segmap { display:flex; align-items:flex-end; gap:3px; min-height:90px; background:var(--panel);
+            border:1px solid var(--line); border-radius:8px; padding:10px; overflow-x:auto; }
+  .seg { position:relative; height:70px; min-width:14px; background:var(--live); border-radius:3px 3px 0 0;
+         flex:0 0 auto; transition:width .4s ease; }
+  .seg .rot { position:absolute; bottom:0; left:0; right:0; background:var(--garbage);
+              border-radius:0 0 0 0; transition:height .4s ease; }
+  .seg.active { outline:2px solid var(--active); outline-offset:1px; }
+  .seg .tip { display:none; position:absolute; bottom:76px; left:0; background:#000; color:var(--ink);
+              padding:3px 7px; border-radius:4px; white-space:nowrap; font-size:11px; z-index:2; }
+  .seg:hover .tip { display:block; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  button { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:6px;
+           padding:7px 14px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--active); }
+  button.primary { border-color:var(--active); color:var(--active); font-weight:600; }
+  #verdict { color:var(--live); }
+  #log { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px;
+         height:130px; overflow-y:auto; font-size:12px; color:var(--dim); }
+  #log .hot { color:var(--active); }
+  #line { color:var(--dim); font-size:11px; word-break:break-all; padding:6px 20px 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SmokeHouse <small>the log is the only truth; every index is a cache — watch it stay true</small></h1>
+</header>
+
+<div class="row">
+  <div class="chip"><b id="keys">–</b><span>live keys</span></div>
+  <div class="chip"><b id="puts">–</b><span>puts</span></div>
+  <div class="chip"><b id="gets">–</b><span>gets</span></div>
+  <div class="chip"><b id="deletes">–</b><span>deletes</span></div>
+  <div class="chip"><b id="garbage">–</b><span>garbage</span></div>
+  <div class="chip"><b id="segcount">–</b><span>segments</span></div>
+  <div class="chip"><b id="regime">–</b><span>regime</span></div>
+</div>
+
+<section>
+  <h2>Segment map — width = bytes on disk, red = the garbage ledger</h2>
+  <div id="segmap"></div>
+</section>
+
+<section>
+  <h2>Controls</h2>
+  <div class="controls">
+    <button class="primary" onclick="fetch('/compact',{method:'POST'})">Compact now</button>
+    <button id="toggle" onclick="toggle()">Pause workload</button>
+    <span id="menu"></span>
+  </div>
+</section>
+
+<section>
+  <h2>Pilot &amp; events</h2>
+  <div id="log"></div>
+</section>
+
+<div id="line"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmtB = n => n > 1048576 ? (n/1048576).toFixed(1)+' MB' : n > 1024 ? (n/1024).toFixed(0)+' KB' : n+' B';
+const fmtN = n => n > 999999 ? (n/1000000).toFixed(2)+'M' : n > 9999 ? (n/1000).toFixed(0)+'k' : String(n);
+let running = true;
+
+function log(msg, hot) {
+  const d = document.createElement('div');
+  if (hot) d.className = 'hot';
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  const box = $('log');
+  box.prepend(d);
+  while (box.childElementCount > 80) box.lastChild.remove();
+}
+
+function toggle() {
+  fetch('/toggle').then(r => r.text()).then(state => {
+    running = state === 'running';
+    $('toggle').textContent = running ? 'Pause workload' : 'Resume workload';
+  });
+}
+
+function drawSegments(segs) {
+  const map = $('segmap');
+  map.innerHTML = '';
+  const maxBytes = Math.max(1, ...segs.map(s => s.bytes));
+  for (const s of segs) {
+    const div = document.createElement('div');
+    div.className = 'seg' + (s.active ? ' active' : '');
+    div.style.width = Math.max(14, Math.round(140 * s.bytes / maxBytes)) + 'px';
+    const rot = document.createElement('div');
+    rot.className = 'rot';
+    rot.style.height = Math.round(70 * (s.bytes ? s.garbage / s.bytes : 0)) + 'px';
+    const tip = document.createElement('div');
+    tip.className = 'tip';
+    tip.textContent = 'seg ' + s.id + (s.active ? ' (active)' : '') + ': ' + fmtB(s.bytes)
+        + ', garbage ' + fmtB(s.garbage);
+    div.append(rot, tip);
+    map.append(div);
+  }
+  $('segcount').textContent = segs.length;
+}
+
+const es = new EventSource('/events');
+es.onmessage = ev => {
+  const m = JSON.parse(ev.data);
+  if (m.t === 'stats') {
+    $('keys').textContent = fmtN(m.keys);
+    $('puts').textContent = fmtN(m.puts);
+    $('gets').textContent = fmtN(m.gets);
+    $('deletes').textContent = fmtN(m.deletes);
+    $('garbage').textContent = fmtB(m.garbage);
+    $('regime').textContent = m.regime;
+    $('line').textContent = m.line;
+    drawSegments(m.segments);
+    const v = m.line.match(/pilot="([^"]*)"/);
+    if (v) {
+      const last = $('log').dataset.verdict;
+      if (v[1] !== last) {
+        $('log').dataset.verdict = v[1];
+        log('pilot: ' + v[1], v[1].startsWith('morph') || v[1].includes('promote'));
+      }
+    }
+  } else if (m.t === 'segments') {
+    drawSegments(m.segments);
+  } else if (m.t === 'regime') {
+    log('regime → ' + m.name);
+  } else if (m.t === 'compacted') {
+    log('COMPACTED: reclaimed ' + fmtB(m.reclaimed), true);
+  } else if (m.t === 'error') {
+    log('store error: ' + m.msg, true);
+  } else if (m.t === 'menu') {
+    const span = $('menu');
+    span.innerHTML = '';
+    for (const name of m.regimes) {
+      const b = document.createElement('button');
+      b.textContent = name;
+      b.onclick = () => fetch('/regime?name=' + encodeURIComponent(name));
+      span.append(b);
+    }
+  }
+};
+es.onerror = () => log('stream lost — retrying…');
+</script>
+</body>
+</html>

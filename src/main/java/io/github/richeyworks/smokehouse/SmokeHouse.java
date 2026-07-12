@@ -3,10 +3,24 @@ package io.github.richeyworks.smokehouse;
 import io.github.richeyworks.csrbt.OrderedSet;
 import io.github.richeyworks.csrbt.adapter.NavigableOrderedSet;
 import io.github.richeyworks.csrbt.control.MorphPolicy;
+import io.github.richeyworks.csrbt.ensemble.EnsembleOrderedSet;
 import io.github.richeyworks.csrbt.event.TreeEvent;
 import io.github.richeyworks.csrbt.strategy.RedBlackStrategy;
+import io.github.richeyworks.csrbt.strategy.TreeStrategy;
+import io.github.richeyworks.csrbt.util.StrategyHealthCheck;
 import io.github.richeyworks.superbeefsort.BeefSort;
+import io.github.richeyworks.superbeefsort.core.SortResult;
+import io.github.richeyworks.superbeefsort.csrbt.AccessPolicy;
+import io.github.richeyworks.superbeefsort.csrbt.EnsembleAdaptation;
+import io.github.richeyworks.superbeefsort.csrbt.EnsembleSpec;
+import io.github.richeyworks.superbeefsort.csrbt.EnsembleTargetFactory;
+import io.github.richeyworks.superbeefsort.csrbt.EvolutionAdaptation;
+import io.github.richeyworks.superbeefsort.csrbt.StrategyAdvisor;
 import io.github.richeyworks.superbeefsort.csrbt.WorkloadAdaptation;
+import io.github.richeyworks.superbeefsort.engine.SortRunResult;
+import io.github.richeyworks.superbeefsort.external.SpillSerializer;
+import io.github.richeyworks.superbeefsort.profile.DataProfile;
+import io.github.richeyworks.superbeefsort.source.RecordSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -23,6 +37,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -46,6 +61,32 @@ import java.util.function.BiConsumer;
  * becoming compactable garbage with no tombstones (recovery re-derives newest-N from log order,
  * which <em>is</em> write order).</p>
  *
+ * <p><b>Phase 3 surfaces — CSRBT at full extent:</b></p>
+ * <ul>
+ *   <li><b>Born optimal:</b> recovery no longer hardcodes Red-Black. The
+ *       {@link SmokeHouseOptions#accessPolicy declared access pattern} + the recovery sort's
+ *       {@link DataProfile} pick the index's balancing strategy via SuperBeefSort's
+ *       {@code StrategyAdvisor}; non-Red-Black bulk builds are health-gated
+ *       ({@link StrategyHealthCheck}) with a Red-Black fallback, mirroring CSRBT's morph ethos.</li>
+ *   <li><b>Profile-guided adaptation:</b> the ADAPTIVE tier hands the sort's profile and realized
+ *       run metrics to {@code WorkloadAdaptation.attachProfileGuided} — the recovery sort primes
+ *       the tree's control plane instead of being thrown away — and the recovery feed itself is
+ *       folded into the workload monitor ({@code recordFeed}), so the first pilot cycle never
+ *       evaluates an empty workload. Range reads are observed too, and every 64th lookup measures
+ *       its <em>realized</em> search depth.</li>
+ *   <li><b>{@link SmokeHouseOptions.IndexTier#ENSEMBLE ENSEMBLE} tier:</b> the index is CSRBT's
+ *       mirrored member trio and the pilot promotes the read path (O(1) swap) and runs the
+ *       failover/quarantine/heal health cadence.</li>
+ *   <li><b>{@link SmokeHouseOptions.IndexTier#EVOLUTION EVOLUTION} tier:</b> CSRBT's evolution
+ *       machine as an index — a laboratory member trials parameterized balancing policies
+ *       (UCB1 bandit) against live traffic, with health-gate deaths and policy-gated
+ *       promotions on the record in {@link #stats()}.</li>
+ *   <li><b>Order statistics:</b> the index maintains subtree sizes intrinsically, so
+ *       {@link #countRange}, {@link #nthKey}, {@link #rankOf}, {@link #medianKey},
+ *       {@link #percentileKey}, {@link #firstKey} and {@link #lastKey} are all O(log n) — free
+ *       power the log itself could never answer without a scan.</li>
+ * </ul>
+ *
  * <p><b>Concurrency:</b> single writer (all mutation, the pilot, and compaction's commit under
  * one store lock); reads resolve the index under the lock and read the log outside it.
  * <b>Bounds, honestly:</b> all keys in memory (the Bitcask trade); key {@code equals} must agree
@@ -54,31 +95,57 @@ import java.util.function.BiConsumer;
  */
 public final class SmokeHouse<K, V> implements Closeable {
 
+    /** Prime the monitor with at most this many trailing feed keys — the rolling window's own size. */
+    private static final int FEED_PRIME_CAP = 4096;
+    /** Every Nth {@link #get} pays one extra O(log n) walk to record the realized search depth. */
+    private static final int DEPTH_SAMPLE_STRIDE = 64;
+    /** Bound on per-range-query monitor updates (bounds the lock hold; the window saturates anyway). */
+    private static final int RANGE_OBSERVE_CAP = 1024;
+    /** Every Nth pilot cycle in the ENSEMBLE tier also runs the failover/quarantine/heal cadence. */
+    private static final int HEALTH_EVERY = 4;
+
+    /** Laboratory members the EVOLUTION tier hosts (the bandit trials on the first). */
+    private static final int EVOLUTION_SLOTS = 1;
+
     private final Object lock = new Object();
     private final SmokeHouseOptions<K, V> opts;
     private final SegmentLog log;
-    private final OrderedSet<IndexEntry<K>> index;
-    private final NavigableOrderedSet<IndexEntry<K>> navigable;
-    private final WorkloadAdaptation<IndexEntry<K>> adaptation;   // null in STATIC tier
-    private final ScheduledExecutorService pilot;                 // null in STATIC tier
-    private final Map<Integer, Long> garbage = new HashMap<>();   // segmentId -> dead bytes; store-lock guarded
+    private final OrderedSet<IndexEntry<K>> index;                 // single-tree tiers; null in ENSEMBLE
+    private final NavigableOrderedSet<IndexEntry<K>> navigable;    // null in ENSEMBLE
+    private final WorkloadAdaptation<IndexEntry<K>> adaptation;    // ADAPTIVE tier only
+    private final EnsembleOrderedSet<IndexEntry<K>> ensemble;      // ENSEMBLE tier only
+    private final EnsembleAdaptation<IndexEntry<K>> promotion;     // ENSEMBLE tier only
+    private final EvolutionAdaptation<IndexEntry<K>> evolution;    // EVOLUTION tier only
+    private final ScheduledExecutorService pilot;                  // null in STATIC tier
+    private final Map<Integer, Long> garbage = new HashMap<>();    // segmentId -> dead bytes; store-lock guarded
     private volatile String pilotVerdict = "not yet evaluated";
+    private volatile boolean compacting;                           // auto-compaction re-entry guard
     private long puts, gets, deletes;
+    private int pilotCycles;
+    private boolean evolutionCycleOpen;                            // pilot-only (store lock)
     private boolean closed;
 
     private SmokeHouse(SmokeHouseOptions<K, V> opts, SegmentLog log, OrderedSet<IndexEntry<K>> index,
-                       WorkloadAdaptation<IndexEntry<K>> adaptation, Map<Integer, Long> recoveredGarbage) {
+                       WorkloadAdaptation<IndexEntry<K>> adaptation,
+                       EnsembleOrderedSet<IndexEntry<K>> ensemble,
+                       EnsembleAdaptation<IndexEntry<K>> promotion,
+                       EvolutionAdaptation<IndexEntry<K>> evolution,
+                       Map<Integer, Long> recoveredGarbage) {
         this.opts = opts;
         this.log = log;
         this.index = index;
-        this.navigable = new NavigableOrderedSet<>(index);
+        this.navigable = (index != null) ? new NavigableOrderedSet<>(index) : null;
         this.adaptation = adaptation;
+        this.ensemble = ensemble;
+        this.promotion = promotion;
+        this.evolution = evolution;
         this.garbage.putAll(recoveredGarbage);
 
         if (opts.retention() > 0) {
             // Retention tier: CSRBT's FIFO window IS the mechanism. Upserts re-enter at the tail
             // (put = remove+add), so eviction order is newest-write-wins. Evicted entries fund
             // the garbage ledger via the event seam — no tombstones needed (see class javadoc).
+            // Single-tree tiers only: open() rejects ENSEMBLE + retention (no Evict events there).
             index.setEventListener(e -> {
                 if (e instanceof TreeEvent.Evict<IndexEntry<K>> ev) {
                     addGarbage(ev.key().segmentId(), ev.key().recordBytes());
@@ -86,7 +153,7 @@ public final class SmokeHouse<K, V> implements Closeable {
             });
             index.setMaxSize(opts.retention());
         }
-        if (adaptation != null) {
+        if (adaptation != null || promotion != null || evolution != null) {
             // The pilot shares the STORE lock (not Autopilot's own): store ops are compound
             // (log append + index update), so single-threaded-equivalence must be enforced here.
             this.pilot = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -97,13 +164,98 @@ public final class SmokeHouse<K, V> implements Closeable {
             long ms = opts.cadence().toMillis();
             pilot.scheduleAtFixedRate(() -> {
                 synchronized (lock) {
-                    var r = adaptation.maybeAdapt();
-                    pilotVerdict = r.morphed() ? "morph " + r.from() + " -> " + r.to()
-                                               : "hold (" + r.reason() + ")";
+                    if (adaptation != null) {
+                        var r = adaptation.maybeAdapt();
+                        pilotVerdict = r.morphed() ? "morph " + r.from() + " -> " + r.to()
+                                                   : "hold (" + r.reason() + ")";
+                    } else if (promotion != null) {
+                        var p = promotion.maybePromote();
+                        String verdict = p.promoted() ? "promote " + p.from() + " -> " + p.to()
+                                                      : "hold (" + p.reason() + ")";
+                        if (++pilotCycles % HEALTH_EVERY == 0) {
+                            var h = promotion.checkHealth();
+                            if (h.failedOver()) {
+                                verdict += "; failover " + h.from() + " -> " + h.to();
+                            }
+                        }
+                        pilotVerdict = verdict;
+                    } else {
+                        pilotVerdict = evolutionCycle();
+                    }
                 }
+                maybeAutoCompact();   // outside the lock: compaction's copy phase must not hold it
             }, ms, ms, TimeUnit.MILLISECONDS);
         } else {
             this.pilot = null;
+        }
+    }
+
+    /**
+     * One EVOLUTION pilot tick: alternate open/close so every trial scores a real traffic window
+     * (open the arm, let ops flow until the next tick, then judge). All throws are folded into
+     * the verdict — an uncaught exception would silently cancel the scheduled pilot task.
+     */
+    private String evolutionCycle() {
+        try {
+            if (!evolutionCycleOpen) {
+                var arms = evolution.beginCycle();
+                evolutionCycleOpen = true;
+                return "trial open: " + arms;
+            }
+            var r = evolution.endCycle();
+            evolutionCycleOpen = false;
+            return r.promoted()
+                    ? String.format("promote genome (cost %.4f beats %.4f)",
+                            r.challengerCost(), r.incumbentCost())
+                    : "hold (" + r.reason() + ")";
+        } catch (RuntimeException halted) {
+            evolutionCycleOpen = false;
+            return "evolution halted (" + halted.getMessage() + ")";
+        }
+    }
+
+    /**
+     * Auto-compaction (Phase 4.3), ridden by the pilot: if the closed segments' garbage ratio
+     * exceeds {@link SmokeHouseOptions#compactWhenGarbageAbove}, run {@link #compact()} right
+     * here on the pilot thread — its copy phase already runs outside the store lock, so the
+     * pilot doing it is safe. Re-entry guarded; failures land in the verdict, never propagate.
+     */
+    private void maybeAutoCompact() {
+        double threshold = opts.compactAbove();
+        if (threshold <= 0.0 || compacting) {
+            return;
+        }
+        synchronized (lock) {
+            if (closed) {
+                return;
+            }
+            try {
+                List<Integer> closedIds = log.closedSegmentIds();
+                if (closedIds.isEmpty()) {
+                    return;
+                }
+                long total = 0;
+                long dead = 0;
+                for (int id : closedIds) {
+                    total += log.segmentSize(id);
+                    dead += garbage.getOrDefault(id, 0L);
+                }
+                if (total <= 0 || (double) dead / total <= threshold) {
+                    return;
+                }
+            } catch (IOException unreadable) {
+                pilotVerdict = pilotVerdict + "; auto-compaction skipped (" + unreadable.getMessage() + ")";
+                return;
+            }
+            compacting = true;
+        }
+        try {
+            long reclaimed = compact();
+            pilotVerdict = pilotVerdict + "; auto-compacted " + reclaimed + " bytes";
+        } catch (IOException failed) {
+            pilotVerdict = pilotVerdict + "; auto-compaction failed (" + failed.getMessage() + ")";
+        } finally {
+            compacting = false;
         }
     }
 
@@ -111,6 +263,13 @@ public final class SmokeHouse<K, V> implements Closeable {
     public static <K, V> SmokeHouse<K, V> open(Path dir, SmokeHouseOptions<K, V> opts) throws IOException {
         Objects.requireNonNull(dir, "dir");
         Objects.requireNonNull(opts, "opts");
+        boolean ensembleBacked = opts.tier() == SmokeHouseOptions.IndexTier.ENSEMBLE
+                || opts.tier() == SmokeHouseOptions.IndexTier.EVOLUTION;
+        if (ensembleBacked && opts.retention() > 0) {
+            throw new IllegalArgumentException("retainNewest requires a single-tree index tier: the "
+                    + "ensemble surfaces no per-member Evict events, so the retention garbage ledger "
+                    + "cannot be funded. Use STATIC or ADAPTIVE with retention, or drop retention.");
+        }
         SegmentLog log = SegmentLog.open(dir, opts.segmentBytesLimit(), opts.fsyncPolicy(),
                 opts.fsyncInterval());
 
@@ -157,16 +316,155 @@ public final class SmokeHouse<K, V> implements Closeable {
             delta[0] = true;
         }
         Comparator<IndexEntry<K>> ordering = IndexEntry.ordering(opts.comparator());
+
+        // The recovery sort is not just a sort: it is SuperBeefSort MEASURING the data. Keep what
+        // it learned — the DataProfile and the realized run metrics prime the control plane below
+        // (the "two engines talking" seam of the ecosystem ADR). Warm starts with no delta skip
+        // the sort and hence carry no profile; adaptation then attaches unprimed, as before.
+        DataProfile profile = null;
+        SortResult sortMetrics = null;
         if ((hint == null || delta[0]) && entries.size() > 1) {
-            entries = BeefSort.with(ordering).source(entries).run().sorted();
+            SortRunResult<IndexEntry<K>> run = BeefSort.with(ordering).source(entries).run();
+            entries = run.sorted();
+            profile = run.profile();
+            sortMetrics = run.sortMetrics();
         }
-        OrderedSet<IndexEntry<K>> index =
-                OrderedSet.fromSorted(entries, new RedBlackStrategy<>(), ordering);
-        WorkloadAdaptation<IndexEntry<K>> adaptation =
-                (opts.tier() == SmokeHouseOptions.IndexTier.ADAPTIVE)
-                        ? WorkloadAdaptation.attach(index, MorphPolicy.defaults())
-                        : null;
-        return new SmokeHouse<>(opts, log, index, adaptation, recoveredGarbage);
+
+        if (opts.tier() == SmokeHouseOptions.IndexTier.ENSEMBLE) {
+            // The mirrored morph-family trio (RB + AVL + Splay): adaptation is an O(1) primary
+            // promotion instead of an O(n) morph. Bulk-loaded per member in O(n) each.
+            EnsembleOrderedSet<IndexEntry<K>> ens = EnsembleTargetFactory.forProfile(
+                    profile, opts.access(), ordering, EnsembleSpec.adaptive());
+            ens.buildAllFromSorted(entries);
+            EnsembleAdaptation<IndexEntry<K>> promotion = (profile != null)
+                    ? EnsembleAdaptation.attachProfileGuided(ens, profile, opts.access(),
+                            sortMetrics, MorphPolicy.defaults())
+                    : EnsembleAdaptation.attach(ens, MorphPolicy.defaults());
+            promotion.recordFeed(feedTail(entries));
+            return new SmokeHouse<>(opts, log, null, null, ens, promotion, null, recoveredGarbage);
+        }
+
+        if (opts.tier() == SmokeHouseOptions.IndexTier.EVOLUTION) {
+            // The evolution machine (CSRBT ADR-011): the access-advised primary holds the throne
+            // while a laboratory member trials parameterized policies against live traffic —
+            // births, deaths, and promotions on the record. Observability tier by CSRBT's own
+            // pre-registered verdict; the performance story stays with ADAPTIVE/ENSEMBLE.
+            EnsembleOrderedSet<IndexEntry<K>> host = EnsembleTargetFactory.evolutionHost(
+                    profile, opts.access(), ordering, EVOLUTION_SLOTS, false);
+            host.buildAllFromSorted(entries);
+            EvolutionAdaptation<IndexEntry<K>> evolution =
+                    EvolutionAdaptation.banditSearch(host, MorphPolicy.defaults());
+            evolution.recordFeed(feedTail(entries));
+            return new SmokeHouse<>(opts, log, null, null, host, null, evolution, recoveredGarbage);
+        }
+
+        // Born optimal (single-tree tiers): the declared access pattern + the measured profile
+        // pick the strategy the index is BUILT with, so the control plane starts from the shape
+        // it would otherwise have to morph toward — construction beats correction.
+        TreeStrategy<IndexEntry<K>> born = bornStrategy(opts, profile);
+        OrderedSet<IndexEntry<K>> index = buildHealthGated(entries, born, ordering);
+        WorkloadAdaptation<IndexEntry<K>> adaptation = null;
+        if (opts.tier() == SmokeHouseOptions.IndexTier.ADAPTIVE) {
+            adaptation = (profile != null)
+                    ? WorkloadAdaptation.attachProfileGuided(index, profile, opts.access(),
+                            sortMetrics, MorphPolicy.defaults())
+                    : WorkloadAdaptation.attach(index, MorphPolicy.defaults());
+            adaptation.recordFeed(feedTail(entries));   // the feed WAS the recent workload
+        }
+        return new SmokeHouse<>(opts, log, index, adaptation, null, null, null, recoveredGarbage);
+    }
+
+    /**
+     * The strategy the index is born with: SuperBeefSort's {@code StrategyAdvisor} over the
+     * declared access pattern + the recovery sort's profile. One clamp (documented on
+     * {@link SmokeHouseOptions#accessPolicy}): WRITE_HEAVY advises WeightBalanced, which has no
+     * {@code StrategyId} and cannot be morph-managed — in the ADAPTIVE tier it becomes Red-Black,
+     * the morph family's rotation-thrifty member.
+     */
+    private static <K> TreeStrategy<IndexEntry<K>> bornStrategy(SmokeHouseOptions<K, ?> opts,
+                                                                DataProfile profile) {
+        if (opts.tier() == SmokeHouseOptions.IndexTier.ADAPTIVE
+                && opts.access() == AccessPolicy.WRITE_HEAVY) {
+            return new RedBlackStrategy<>();
+        }
+        return StrategyAdvisor.advise(profile, opts.access());
+    }
+
+    /**
+     * O(n) bulk build under CSRBT's own morph ethos: a non-Red-Black build must pass
+     * {@link StrategyHealthCheck} before it serves reads; a failure falls back to the
+     * always-valid Red-Black build rather than publishing a tree in a dubious shape.
+     */
+    private static <K> OrderedSet<IndexEntry<K>> buildHealthGated(List<IndexEntry<K>> entries,
+            TreeStrategy<IndexEntry<K>> born, Comparator<IndexEntry<K>> ordering) {
+        OrderedSet<IndexEntry<K>> set = OrderedSet.fromSorted(entries, born, ordering);
+        if (!(born instanceof RedBlackStrategy)
+                && !StrategyHealthCheck.validate(set.getEngine(), set.getStrategy(), entries).isEmpty()) {
+            return OrderedSet.fromSorted(entries, new RedBlackStrategy<>(), ordering);
+        }
+        return set;
+    }
+
+    /** The trailing slice of the feed that still fits the monitor's rolling window. */
+    private static <T> List<T> feedTail(List<T> entries) {
+        int n = entries.size();
+        return entries.subList(Math.max(0, n - FEED_PRIME_CAP), n);
+    }
+
+    /**
+     * Import a whole {@link RecordSource} into a <b>fresh</b> store at {@code dir} — <em>ingestion
+     * as recovery</em> (ADR Phase 3). Instead of {@link #put}-ing each record (two O(log n) index
+     * ops apiece), this appends every record straight to a bare {@link SegmentLog} with <b>no index
+     * maintenance at all</b> — that is the whole trick — then returns
+     * {@link #open(Path, SmokeHouseOptions)}, whose recovery already does the elegant part: scan the
+     * log, resolve duplicate keys <em>last-writer-wins</em> (a later source record overwrites an
+     * earlier one with the same key), sort the survivors with SuperBeefSort, and build the index in
+     * O(n) via {@code OrderedSet.fromSorted}. An import is thus a pre-compacted store.
+     *
+     * <p>v1 targets an empty directory: if {@code dir} already contains segments this fails loudly
+     * (importing into a populated store would mean upsert-against-existing, which is what
+     * {@link #put} is for). The {@code source} is consumed once and closed. The bulk append's
+     * durability follows {@code opts}' {@link Fsync} policy; the log is forced before recovery
+     * regardless.
+     *
+     * @throws IllegalStateException if {@code dir} already contains segment files
+     */
+    public static <K, V> SmokeHouse<K, V> importInto(Path dir, SmokeHouseOptions<K, V> opts,
+                                                     RecordSource<K, V> source) throws IOException {
+        Objects.requireNonNull(dir, "dir");
+        Objects.requireNonNull(opts, "opts");
+        Objects.requireNonNull(source, "source");
+        try (source) {                                   // closed on every path, incl. the guard throw
+            if (SegmentLog.hasSegments(dir)) {
+                throw new IllegalStateException("importInto targets a fresh store, but " + dir
+                        + " already contains segments — open it and put(...) instead, or import into "
+                        + "an empty directory.");
+            }
+            SegmentLog log = SegmentLog.open(dir, opts.segmentBytesLimit(), opts.fsyncPolicy(),
+                    opts.fsyncInterval());
+            try {
+                RecordSource.Record<K, V> rec;
+                while ((rec = source.next()) != null) {
+                    byte[] key = encodeField(opts.keySerializer(),
+                            Objects.requireNonNull(rec.key(), "record key"));
+                    byte[] value = encodeField(opts.valueSerializer(),
+                            Objects.requireNonNull(rec.value(), "record value"));
+                    log.append(RecordCodec.encode(key, value, false));   // append only — no index
+                }
+                log.force();
+            } finally {
+                log.close();
+            }
+        }
+        return open(dir, opts);
+    }
+
+    private static <T> byte[] encodeField(SpillSerializer<T> serializer, T value) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(32);
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            serializer.write(value, out);
+        }
+        return bytes.toByteArray();
     }
 
     // ── Data plane ────────────────────────────────────────────────────────────────────────────
@@ -177,11 +475,17 @@ public final class SmokeHouse<K, V> implements Closeable {
         Objects.requireNonNull(value, "value");
         byte[] record = RecordCodec.encode(keyBytes(key), valueBytes(value), false);
         synchronized (lock) {
-            IndexEntry<K> prev = floorHit(key);
+            IndexEntry<K> prev = liveEntry(key);
             SegmentLog.Location loc = log.append(record);            // truth before cache
             IndexEntry<K> entry = new IndexEntry<>(key, loc.segmentId(), loc.offset(), record.length);
-            if (adaptation != null) {
-                adaptation.remove(IndexEntry.probe(key));             // upsert = remove + add (ADR D2)
+            if (evolution != null) {
+                evolution.remove(IndexEntry.probe(key));              // upsert = remove + add (ADR D2)
+                evolution.add(entry);
+            } else if (promotion != null) {
+                promotion.remove(IndexEntry.probe(key));
+                promotion.add(entry);
+            } else if (adaptation != null) {
+                adaptation.remove(IndexEntry.probe(key));
                 adaptation.add(entry);
             } else {
                 index.remove(IndexEntry.probe(key));
@@ -204,10 +508,8 @@ public final class SmokeHouse<K, V> implements Closeable {
         for (int attempt = 0; ; attempt++) {
             IndexEntry<K> entry;
             synchronized (lock) {
-                entry = floorHit(key);
-                if (adaptation != null) {
-                    adaptation.recordSearch(key.hashCode());          // read mix + skew for the scorer
-                }
+                entry = liveEntry(key);
+                observeGet(key);                                      // read mix + skew (+ sampled depth)
                 gets++;
             }
             if (entry == null) {
@@ -229,15 +531,45 @@ public final class SmokeHouse<K, V> implements Closeable {
         }
     }
 
+    /**
+     * Feed the lookup into the workload monitor. Most reads record hash + depth-0 (the walk
+     * already happened in {@link #liveEntry}); every {@link #DEPTH_SAMPLE_STRIDE}-th read pays
+     * one extra O(log n) walk to record the REALIZED search depth — CSRBT's primary signal for
+     * how good the current tree shape is, sampled so honesty stays cheap.
+     */
+    private void observeGet(K key) {
+        if (adaptation == null && promotion == null && evolution == null) {
+            return;
+        }
+        int hash = key.hashCode();
+        int depth = 0;
+        if (gets % DEPTH_SAMPLE_STRIDE == 0) {
+            int d = (ensemble != null) ? ensemble.searchDepth(IndexEntry.probe(key))
+                                       : index.searchDepth(IndexEntry.probe(key));
+            depth = (d >= 0) ? d : ~d;
+        }
+        if (adaptation != null) {
+            adaptation.recordSearch(hash, depth);
+        } else if (promotion != null) {
+            promotion.recordSearch(hash, depth);
+        } else {
+            evolution.recordSearch(hash, depth);
+        }
+    }
+
     /** Delete: a durable tombstone in the log, then the index entry goes. Returns whether the key existed. */
     public boolean delete(K key) throws IOException {
         Objects.requireNonNull(key, "key");
         byte[] record = RecordCodec.encode(keyBytes(key), null, true);
         synchronized (lock) {
-            IndexEntry<K> prev = floorHit(key);
+            IndexEntry<K> prev = liveEntry(key);
             SegmentLog.Location loc = log.append(record);             // truth before cache
             addGarbage(loc.segmentId(), record.length);               // a tombstone is born dead weight
-            if (adaptation != null) {
+            if (evolution != null) {
+                evolution.remove(IndexEntry.probe(key));
+            } else if (promotion != null) {
+                promotion.remove(IndexEntry.probe(key));
+            } else if (adaptation != null) {
                 adaptation.remove(IndexEntry.probe(key));
             } else {
                 index.remove(IndexEntry.probe(key));
@@ -252,12 +584,15 @@ public final class SmokeHouse<K, V> implements Closeable {
 
     /**
      * Visit every record with {@code lo <= key <= hi} in key order. The entry list snapshots
-     * under the lock (CSRBT's range walk); values then stream from the log outside it.
+     * under the lock (CSRBT's range walk); values then stream from the log outside it. Range
+     * traffic is folded into the workload monitor (capped per call), so range-heavy workloads
+     * are visible to the pilot instead of invisible.
      */
     public void range(K lo, K hi, BiConsumer<K, V> consumer) throws IOException {
         List<IndexEntry<K>> entries;
         synchronized (lock) {
-            entries = index.rangeQuery(IndexEntry.probe(lo), IndexEntry.probe(hi));
+            entries = indexRange(IndexEntry.probe(lo), IndexEntry.probe(hi));
+            observeRange(entries);
         }
         for (IndexEntry<K> e : entries) {
             RecordCodec.Rec rec = log.read(e.location());
@@ -265,6 +600,92 @@ public final class SmokeHouse<K, V> implements Closeable {
                 throw new IOException("index pointed at an unreadable record at " + e.location());
             }
             consumer.accept(e.key(), readValue(rec.value()));
+        }
+    }
+
+    /** Each ranged key was a read; tell the monitor so (bounded — the rolling window saturates anyway). */
+    private void observeRange(List<IndexEntry<K>> hits) {
+        if (adaptation == null && promotion == null && evolution == null) {
+            return;
+        }
+        int n = Math.min(hits.size(), RANGE_OBSERVE_CAP);
+        for (int i = 0; i < n; i++) {
+            int hash = Objects.hashCode(hits.get(i).key());
+            if (adaptation != null) {
+                adaptation.recordSearch(hash);
+            } else if (promotion != null) {
+                promotion.recordSearch(hash, 0);
+            } else {
+                evolution.recordSearch(hash, 0);
+            }
+        }
+    }
+
+    // ── Order statistics (CSRBT's RankedSet face, O(log n) each — no log I/O involved) ─────────
+
+    /** Number of live keys with {@code lo <= key <= hi} — two rank walks, no scan. */
+    public int countRange(K lo, K hi) {
+        synchronized (lock) {
+            return (ensemble != null)
+                    ? ensemble.countInRange(IndexEntry.probe(lo), IndexEntry.probe(hi))
+                    : index.countInRange(IndexEntry.probe(lo), IndexEntry.probe(hi));
+        }
+    }
+
+    /**
+     * The {@code rank}-th smallest live key, <b>1-indexed</b> (1 = minimum, {@link #size()} =
+     * maximum) — CLRS OS-SELECT.
+     *
+     * @throws IndexOutOfBoundsException if {@code rank < 1} or {@code rank > size()}
+     */
+    public K nthKey(int rank) {
+        synchronized (lock) {
+            IndexEntry<K> e = (ensemble != null) ? ensemble.select(rank) : index.select(rank);
+            return (e == null) ? null : e.key();
+        }
+    }
+
+    /** The <b>1-indexed</b> rank of {@code key} among live keys, or {@code 0} if absent — CLRS OS-RANK. */
+    public int rankOf(K key) {
+        synchronized (lock) {
+            try {
+                return (ensemble != null) ? ensemble.rank(IndexEntry.probe(key))
+                                          : index.rank(IndexEntry.probe(key));
+            } catch (NoSuchElementException absent) {
+                return 0;
+            }
+        }
+    }
+
+    /** The lower-median live key, or {@code null} if the store is empty. */
+    public K medianKey() {
+        synchronized (lock) {
+            IndexEntry<K> e = (ensemble != null) ? ensemble.median() : index.median();
+            return (e == null) ? null : e.key();
+        }
+    }
+
+    /** The {@code pct}-th percentile live key (0–100; 50 = median), or {@code null} if empty. */
+    public K percentileKey(int pct) {
+        synchronized (lock) {
+            IndexEntry<K> e = (ensemble != null) ? ensemble.percentile(pct) : index.percentile(pct);
+            return (e == null) ? null : e.key();
+        }
+    }
+
+    /** The smallest live key, or {@code null} if the store is empty. */
+    public K firstKey() {
+        synchronized (lock) {
+            IndexEntry<K> e = (ensemble != null) ? ensemble.minimum() : index.minimum();
+            return (e == null) ? null : e.key();
+        }
+    }
+
+    /** The largest live key, or {@code null} if the store is empty. */
+    public K lastKey() {
+        synchronized (lock) {
+            IndexEntry<K> e = (ensemble != null) ? ensemble.maximum() : index.maximum();
+            return (e == null) ? null : e.key();
         }
     }
 
@@ -287,7 +708,7 @@ public final class SmokeHouse<K, V> implements Closeable {
             }
             minId = closed.get(0);
             maxId = closed.get(closed.size() - 1);
-            for (IndexEntry<K> e : index.inOrder()) {                 // already key-sorted
+            for (IndexEntry<K> e : indexInOrder()) {                  // already key-sorted
                 if (e.segmentId() <= maxId) {
                     victims.add(e);
                 }
@@ -325,10 +746,13 @@ public final class SmokeHouse<K, V> implements Closeable {
             }
             for (int i = 0; i < victims.size(); i++) {
                 IndexEntry<K> victim = victims.get(i);
-                IndexEntry<K> current = floorHit(victim.key());
+                IndexEntry<K> current = liveEntry(victim.key());
                 if (current != null && current.sameLocation(victim)) {
-                    index.remove(victim);                             // repoint: same key, new address
-                    index.add(replacements.get(i));
+                    // Repoint: same key, new address. Deliberately NOT recorded in the workload
+                    // monitor — compaction is maintenance, not traffic; recording it would skew
+                    // the pilot's read/write mix with our own housekeeping.
+                    maintenanceRemove(victim);
+                    maintenanceAdd(replacements.get(i));
                 } else {
                     // The workload overwrote/deleted/evicted this key mid-copy: our fresh copy
                     // is dead on arrival — honest garbage in the merged segment.
@@ -341,7 +765,27 @@ public final class SmokeHouse<K, V> implements Closeable {
 
     /** Number of live keys. */
     public int size() {
-        return index.size();
+        return (ensemble != null) ? ensemble.size() : index.size();
+    }
+
+    /** One segment's live picture: total bytes on disk, dead bytes in the ledger, and whether it's the active tail. */
+    public record SegmentStat(int segmentId, long bytes, long garbageBytes, boolean active) { }
+
+    /**
+     * The per-segment map (Phase 4.4 observability): every closed segment plus the active tail,
+     * each with its size and its share of the garbage ledger — the raw material of the
+     * dashboard's segment bars, and of any external monitoring.
+     */
+    public List<SegmentStat> segmentStats() throws IOException {
+        synchronized (lock) {
+            List<SegmentStat> out = new ArrayList<>();
+            for (int id : log.closedSegmentIds()) {
+                out.add(new SegmentStat(id, log.segmentSize(id), garbage.getOrDefault(id, 0L), false));
+            }
+            int active = log.activeSegmentId();
+            out.add(new SegmentStat(active, log.segmentSize(active), garbage.getOrDefault(active, 0L), true));
+            return out;
+        }
     }
 
     /** Total dead bytes across all segments — what a {@link #compact()} could reclaim from closed ones. */
@@ -355,26 +799,55 @@ public final class SmokeHouse<K, V> implements Closeable {
         }
     }
 
-    /** A one-line health/shape summary. */
+    /** A one-line health/shape summary, including the control plane's own report. */
     public String stats() {
         try {
-            return "SmokeHouse{keys=" + index.size()
-                    + ", segments=" + log.segmentCount()
-                    + ", garbageBytes=" + garbageBytes()
-                    + ", strategy=" + index.getStrategy().getClass().getSimpleName()
-                    + ", tier=" + opts.tier()
-                    + (opts.retention() > 0 ? ", retain=" + opts.retention() : "")
-                    + ", fsync=" + opts.fsyncPolicy()
-                    + ", pilot=\"" + pilotVerdict + "\""
-                    + ", puts=" + puts + ", gets=" + gets + ", deletes=" + deletes + "}";
+            synchronized (lock) {
+                String shape = (ensemble != null)
+                        ? "ensemble(primary=" + (promotion != null
+                                ? String.valueOf(promotion.currentPrimary())
+                                : ensemble.primary().strategyName()) + ")"
+                        : index.getStrategy().getClass().getSimpleName();
+                return "SmokeHouse{keys=" + size()
+                        + ", segments=" + log.segmentCount()
+                        + ", garbageBytes=" + garbageBytes()
+                        + ", strategy=" + shape
+                        + ", tier=" + opts.tier()
+                        + ", access=" + opts.access()
+                        + (opts.retention() > 0 ? ", retain=" + opts.retention() : "")
+                        + ", fsync=" + opts.fsyncPolicy()
+                        + ", pilot=\"" + pilotVerdict + "\""
+                        + (adaptation != null
+                                ? ", adaptation=" + adaptation.adaptationReport()
+                                        + ", rotations=" + index.rotationCount()
+                                : "")
+                        + (promotion != null ? ", promotion=" + promotion.report() : "")
+                        + (evolution != null ? ", evolution=" + evolution.mode()
+                                + "[cycles=" + evolution.cycles()
+                                + ", promotions=" + evolution.promotions() + "]" : "")
+                        + ", puts=" + puts + ", gets=" + gets + ", deletes=" + deletes + "}";
+            }
         } catch (IOException e) {
             return "SmokeHouse{stats unavailable: " + e.getMessage() + "}";
         }
     }
 
-    /** The live index — every CSRBT read on it is torn-read-free from any thread. */
+    /**
+     * The live single-tree index — every CSRBT read on it is torn-read-free from any thread.
+     *
+     * @throws IllegalStateException in the ensemble-backed tiers (use {@link #ensembleIndex()})
+     */
     public OrderedSet<IndexEntry<K>> index() {
+        if (index == null) {
+            throw new IllegalStateException(
+                    "this store runs an ensemble-backed tier — use ensembleIndex()");
+        }
         return index;
+    }
+
+    /** The live ensemble index, or {@code null} unless this store runs an ensemble-backed tier. */
+    public EnsembleOrderedSet<IndexEntry<K>> ensembleIndex() {
+        return ensemble;
     }
 
     /** Clean shutdown: force the log, write the hint checkpoint (next open is a warm start), close. Idempotent. */
@@ -390,13 +863,16 @@ public final class SmokeHouse<K, V> implements Closeable {
             closed = true;
             log.force();
             try {
-                HintFile.write(log.hintPath(), index.inOrder(), log.activeSegmentId(),
+                HintFile.write(log.hintPath(), indexInOrder(), log.activeSegmentId(),
                         garbage, keyCodec(opts));
             } catch (IOException hintFailed) {
                 // A hint is an optimization; a failed one must never fail the close. Next open
                 // simply cold-scans.
             }
             log.close();
+            if (ensemble != null) {
+                ensemble.close();                                     // member executor shutdown
+            }
         }
     }
 
@@ -406,9 +882,40 @@ public final class SmokeHouse<K, V> implements Closeable {
         garbage.merge(segmentId, bytes, Long::sum);
     }
 
-    private IndexEntry<K> floorHit(K key) {
-        IndexEntry<K> f = navigable.floor(IndexEntry.probe(key));
+    /** The stored entry for {@code key}, or {@code null} — exact match on the live index. */
+    private IndexEntry<K> liveEntry(K key) {
+        IndexEntry<K> probe = IndexEntry.probe(key);
+        if (ensemble != null) {
+            List<IndexEntry<K>> hit = ensemble.rangeQuery(probe, probe);
+            return hit.isEmpty() ? null : hit.get(0);
+        }
+        IndexEntry<K> f = navigable.floor(probe);
         return (f != null && opts.comparator().compare(f.key(), key) == 0) ? f : null;
+    }
+
+    private List<IndexEntry<K>> indexRange(IndexEntry<K> lo, IndexEntry<K> hi) {
+        return (ensemble != null) ? ensemble.rangeQuery(lo, hi) : index.rangeQuery(lo, hi);
+    }
+
+    private List<IndexEntry<K>> indexInOrder() {
+        return (ensemble != null) ? ensemble.inOrder() : index.inOrder();
+    }
+
+    /** Index maintenance (compaction repoint): apply without feeding the workload monitor. */
+    private void maintenanceRemove(IndexEntry<K> e) {
+        if (ensemble != null) {
+            ensemble.remove(e);
+        } else {
+            index.remove(e);
+        }
+    }
+
+    private void maintenanceAdd(IndexEntry<K> e) {
+        if (ensemble != null) {
+            ensemble.add(e);
+        } else {
+            index.add(e);
+        }
     }
 
     private static <K, V> HintFile.KeyCodec<K> keyCodec(SmokeHouseOptions<K, V> opts) {

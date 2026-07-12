@@ -34,10 +34,44 @@ Serializers are SuperBeefSort's `SpillSerializer` contract — `forLongs()`, `fo
 
 ## What you get
 
-**An index that tunes itself.** By default the store's index is wired to CSRBT's control plane
-and flown by an internal pilot: it watches your real access pattern — read/write mix, key skew,
-realized walk depths — and re-shapes itself through anti-thrash gates. No knobs, no DBA.
-`IndexTier.STATIC` opts out.
+**An index that is born optimal, then tunes itself.** Recovery doesn't hardcode a tree shape:
+your declared `accessPolicy(...)` (READ_HEAVY, SKEWED, WRITE_HEAVY, BALANCED) plus the recovery
+sort's own data profile pick the balancing strategy the index is *built* with, and the sort's
+measurements prime the control plane's scorer. From there the default tier's internal pilot
+watches your real access pattern — read/write mix, key skew, realized walk depths, range scans —
+and re-shapes the index through anti-thrash gates. No knobs, no DBA. Four tiers:
+`STATIC` (born optimal, never re-shapes), `ADAPTIVE` (the default: health-gated O(n) morphs),
+`ENSEMBLE` (a mirrored RB+AVL+Splay trio; adaptation is an O(1) read-path promotion, with
+failover/quarantine/heal), and `EVOLUTION` (CSRBT's evolution machine: a laboratory member
+trials balancing policies against live traffic — an observability tier, on the record).
+
+**Secondary indexes.** `IndexedStore` composes named secondaries over the primary: declare an
+attribute extractor and a comparator, and `byAttribute(name, lo, hi)` answers value-attribute
+ranges in one index walk (composite `(attribute, key)` entries — no post-filtering). Same
+consistency story as everything else: secondaries are memory-only caches rebuilt from the log
+on every open, so a crash can't lose them either. Indexed writes pay one extra primary read
+(the old value must be retracted); v1 refuses `retainNewest` + secondaries.
+
+```java
+var store = IndexedStore.open(dir, opts)
+        .secondary("price", Comparator.<Long>naturalOrder(), Order::price)
+        .interval("window", Order::startMinute, Order::endMinute)
+        .build();
+store.byAttribute("price", 100L, 500L);   // keys of every order priced 100..500
+store.stab("window", 1_440);              // keys of every order whose window covers minute 1440
+store.overlapping("window", 900, 960);    // ...or overlapping 900..960
+```
+
+**An interval index** (same builder) answers *stabbing* and *overlap* queries over records
+carrying an `(int start, int end)` span — CSRBT's CLRS-14.3 interval tree with subtree max-end
+augmentation doing the pruning, and an exact sidecar resolving candidates, so duplicate starts
+and even duplicate whole spans just work. Endpoints are `int` in v1 (epoch minutes/seconds —
+that's the augmentor's honest bound, not ours).
+
+**Order statistics for free.** The index maintains subtree sizes intrinsically, so
+`countRange(lo, hi)`, `nthKey(rank)`, `rankOf(key)`, `medianKey()`, `percentileKey(pct)`,
+`firstKey()` and `lastKey()` are all O(log n) — answers the log alone could never give without
+a full scan, and they're correct immediately after recovery's bulk build.
 
 **A durability dial, not a durability sermon.** `Fsync.INTERVAL` (default) group-syncs every
 50 ms — a small, explicit loss window at near-`OS` throughput. `ALWAYS` for nothing-ever-lost,
@@ -48,7 +82,10 @@ realized walk depths — and re-shapes itself through anti-thrash gates. No knob
 and scans only the segments written afterwards. Hints are optimizations, never truth: corrupt,
 stale, or referencing replaced files → silently ignored, full scan, correct answer.
 
-**Crash-safe compaction.** `compact()` merges all closed segments into one key-ordered segment
+**Crash-safe compaction — automatic by default.** On piloted tiers the pilot watches the
+closed segments' garbage ratio and runs compaction itself once it crosses
+`compactWhenGarbageAbove` (default 0.5; `0` disables — and the pilot-less `STATIC` tier is
+always manual). `compact()` merges all closed segments into one key-ordered segment
 containing exactly the live records. The commit is a marker protocol — scratch file forced to
 disk, then a durable marker (the point of no return), then the swap — and an interrupted commit
 replays or rolls back idempotently on the next open. Dropped tombstones can never resurrect
@@ -60,6 +97,22 @@ repointed index.
 window does the evicting (upserts re-enter at the tail, so eviction order is write order), and
 evictions fund the garbage ledger with no tombstones needed: recovery re-derives newest-N from
 log order, which *is* write order.
+
+**Bulk import — ingestion *is* recovery.** `SmokeHouse.importInto(dir, opts, source)` ingests a
+whole [`RecordSource`](https://github.com/RicheyWorks/SuperBeefSort) (CSV, JSONL, or binary)
+into a fresh store by appending every record straight to a bare log with **no index maintenance
+at all**, then handing off to `open()` — whose recovery already sorts and builds the index in
+O(n). An import is therefore a pre-compacted store, and it reuses the exact recovery muscle every
+restart exercises. Duplicate keys resolve last-writer-wins; v1 targets an empty directory
+(importing into a populated store is what `put` is for).
+
+```java
+try (var store = SmokeHouse.importInto(dir, opts,
+        CsvSource.of(csv, /*keyCol*/0, /*valCol*/1, /*skipHeader*/true,
+                Long::parseLong, s -> s))) {
+    store.get(42L);                      // fully indexed, born from the CSV
+}
+```
 
 ## The recovery story
 
@@ -76,8 +129,12 @@ Read these before depending on it (they're the ADR's explicit trades, not accide
   key-indexed record data, not a general database; the hard ceiling is CSRBT's 2³¹-key index.
 - **Key `equals`/`hashCode` must agree with the comparator** (standard `TreeMap` + `HashMap`
   interop discipline; recovery's last-writer-wins and the index's skew detection rely on it).
-- **Compaction is manual.** The garbage ledger (`garbageBytes()`, `stats()`) tells you when
-  it's worth calling; auto-triggering is Phase 4 territory, alongside the live dashboard.
+- **Compaction is automatic only where a pilot flies.** Piloted tiers self-compact past the
+  `compactWhenGarbageAbove` ratio; the `STATIC` tier has no pilot, so there the garbage ledger
+  (`garbageBytes()`, `stats()`) tells you when `compact()` is worth calling.
+- **The ensemble-backed tiers cost memory and refuse retention.** `ENSEMBLE`/`EVOLUTION`
+  mirror every key into each member (~3× index memory for the trio) and surface no per-member
+  eviction events, so `retainNewest` is rejected at open — by design, loudly.
 - **Single-writer.** All mutation serializes on one store lock (reads resolve the index under
   it and stream the log outside it). That's a contract inherited from the control plane, not a
   temporary limitation.
@@ -93,12 +150,29 @@ Java 17+, Gradle 9 (wrapper included). Tests are deterministic and oracle-driven
 behavior is asserted against a `TreeMap` reference, including across crashes, compactions, and
 reopens.
 
+## The shop window
+
+```bash
+./gradlew run     # then open http://127.0.0.1:8079/
+```
+
+A live SmokeHouse on exhibit: a built-in workload churns a temp-dir store through flipping
+regimes (steady churn, hot-key overwrite, read-heavy, delete wave) while the page watches over
+Server-Sent Events — keys/puts/gets/deletes ticking, the pilot's verdicts as they change, and
+the **segment map**: one bar per log segment, its red fill the garbage ledger made visible.
+Press *Compact now* and watch the map squash to a handful of clean segments while the workload
+keeps running (compaction's copy phase is off the store lock by design). Binds loopback only —
+an exhibit, not a service.
+
 ## Design
 
 The full architecture — why Bitcask-style beat LSM here, the `IndexEntry` trick that turns a
 set into a map through public API only, the compaction crash windows, and the roadmap
-(Phase 3: file ingestion + trace replay; Phase 4: secondary & interval indexes, ensemble index
-tier, live dashboard) — lives in the ecosystem ADR:
+(Phase 3 ✓: file ingestion + trace replay — `importInto` here, the `RecordSource` trio and trace
+record/replay in SuperBeefSort; Phase 4 in flight: ensemble + evolution index tiers ✓, the
+CSRBT full-extent unlock ✓ — born-optimal builds, profile-guided adaptation, order statistics —
+auto-compaction ✓, `IndexedStore` secondaries ✓, the interval index ✓, and the store
+dashboard ✓) — lives in the ecosystem ADR:
 [`SuperBeefSort/docs/adr-smokehouse-ecosystem-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-smokehouse-ecosystem-ring.md).
 
 ## License
