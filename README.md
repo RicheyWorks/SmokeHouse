@@ -100,6 +100,15 @@ it, and drops a generation-numbered **manifest** naming the copied set. Restore 
 The manifest is advisory like the hint (missing or corrupt → simply not used); retained generations
 are point-in-time markers. Writes taken after the call never leak into the copy.
 
+**A change stream, watchers, and point-in-time snapshots.** `tail(fromSequence, listener)` streams
+every committed mutation in order — the single-writer log makes it gap-free — with a bounded ring
+for replay and per-consumer queues drained *off* the store lock, so a slow listener drops oldest
+(and is told via `onGap()`) rather than stalling the writer. `watch(key, ...)` and
+`watchRange(lo, hi, ...)` are filtered views of it. `snapshot()` freezes an O(n) clone of the index
+over the immutable segments: reads on it never block the writer and never see later mutations (an
+overwrite appends a new record; the snapshot keeps reading the old one), and compaction is deferred
+while it is pinned.
+
 **A retention tier.** `retainNewest(n)` keeps only the newest-written N keys — CSRBT's FIFO
 window does the evicting (upserts re-enter at the tail, so eviction order is write order), and
 evictions fund the garbage ledger with no tombstones needed: recovery re-derives newest-N from
@@ -206,10 +215,11 @@ set into a map through public API only, the compaction crash windows, and every 
 Its four phases (core store, durability + compaction, ingestion, the index ring + dashboard) are
 all complete.
 
-The successor ADR carries what comes next. Measurement and durability hardening have **landed** —
-the JMH suite (Benchmarks above, §D1 seam decided by number), an append/torn-tail crash-fuzz
-harness, an advisory segment manifest, and backup/restore; still ahead are a log-tail primitive
-feeding watchers and snapshots, tail-shipped read replicas, and Maven Central release:
+The successor ADR carries what comes next. Measurement, durability hardening, and the read/watch
+surface have **landed** — the JMH suite (Benchmarks above, §D1 seam decided by number), an
+append/torn-tail crash-fuzz harness, an advisory segment manifest, backup/restore, and the log tail
+feeding watchers and point-in-time snapshots; still ahead are generic (typed) interval endpoints,
+tail-shipped read replicas, and Maven Central release:
 [`SuperBeefSort/docs/adr-ecosystem-outer-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-ecosystem-outer-ring.md).
 
 ## License
