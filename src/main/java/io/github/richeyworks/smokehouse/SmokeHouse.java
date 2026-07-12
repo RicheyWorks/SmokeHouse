@@ -808,6 +808,31 @@ public final class SmokeHouse<K, V> implements Closeable {
         }
     }
 
+    /**
+     * Snapshot the current segment set into a fresh, generation-numbered {@link ManifestFile}
+     * (Phase 6 — advisory: backup and replication consume it; recovery never does). Runs under the
+     * store lock so the named set and its byte lengths are a consistent instant, and each CRC covers
+     * an immutable prefix. The next generation is one past the highest manifest already present, so
+     * numbering is monotonic even across a corrupt one. Returns the generation written.
+     *
+     * <p>Cost note: this CRCs every live segment under the lock. That is fine for occasional
+     * checkpoints; backup (Phase 6) rolls the active segment first and copies off-lock.</p>
+     */
+    public long writeManifest() throws IOException {
+        synchronized (lock) {
+            Path dir = log.directory();
+            List<ManifestFile.SegmentEntry> entries = new ArrayList<>();
+            for (int id : log.segmentIds()) {
+                long size = log.segmentSize(id);
+                entries.add(new ManifestFile.SegmentEntry(id, size, ManifestFile.crcOf(log.segmentPath(id), size)));
+            }
+            List<Long> gens = ManifestFile.generations(dir);
+            long generation = gens.isEmpty() ? 1 : gens.get(gens.size() - 1) + 1;
+            ManifestFile.write(dir, new ManifestFile.Manifest(generation, entries));
+            return generation;
+        }
+    }
+
     /** A one-line health/shape summary, including the control plane's own report. */
     public String stats() {
         try {

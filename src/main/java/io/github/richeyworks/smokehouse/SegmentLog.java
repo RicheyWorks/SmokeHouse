@@ -316,6 +316,11 @@ final class SegmentLog implements Closeable {
         return dir.resolve(HINT_FILE);
     }
 
+    /** The store directory (segments, hint, and manifests all live here). */
+    Path directory() {
+        return dir;
+    }
+
     int activeSegmentId() {
         return activeId;
     }
