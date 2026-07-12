@@ -53,5 +53,5 @@ jmh {
     iterations = 5
     resultFormat = "JSON"
     resultsFile = layout.buildDirectory.file("reports/jmh/results.json")
-    // includes = listOf("StoreOpsBenchmark.upsert")
+    // includes = listOf("IndexUpsertBenchmark")   // e.g. the fast D1 seam run (~2 min, skips the store single-shots)
 }
