@@ -109,6 +109,9 @@ public final class SmokeHouse<K, V> implements Closeable {
     /** Laboratory members the EVOLUTION tier hosts (the bandit trials on the first). */
     private static final int EVOLUTION_SLOTS = 1;
 
+    /** Recent committed mutations the tail keeps for late subscribers to replay. */
+    private static final int TAIL_RING_CAPACITY = 1 << 12;
+
     private final Object lock = new Object();
     private final SmokeHouseOptions<K, V> opts;
     private final SegmentLog log;
@@ -120,6 +123,7 @@ public final class SmokeHouse<K, V> implements Closeable {
     private final EvolutionAdaptation<IndexEntry<K>> evolution;    // EVOLUTION tier only
     private final ScheduledExecutorService pilot;                  // null in STATIC tier
     private final Map<Integer, Long> garbage = new HashMap<>();    // segmentId -> dead bytes; store-lock guarded
+    private final Tail<K, V> tailStream = new Tail<>(TAIL_RING_CAPACITY);   // Phase 7: committed-mutation stream
     private volatile String pilotVerdict = "not yet evaluated";
     private volatile boolean compacting;                           // single-compaction guard: serializes compact()
     private long puts, gets, deletes;
@@ -498,6 +502,7 @@ public final class SmokeHouse<K, V> implements Closeable {
                 addGarbage(prev.segmentId(), prev.recordBytes());     // the old version just died
             }
             puts++;
+            tailStream.publish(key, value, false, loc.segmentId(), loc.offset());
         }
     }
 
@@ -581,6 +586,7 @@ public final class SmokeHouse<K, V> implements Closeable {
                 addGarbage(prev.segmentId(), prev.recordBytes());
             }
             deletes++;
+            tailStream.publish(key, null, true, loc.segmentId(), loc.offset());
             return prev != null;
         }
     }
@@ -880,6 +886,23 @@ public final class SmokeHouse<K, V> implements Closeable {
         return open(backupDir, opts);
     }
 
+    /**
+     * Subscribe to the tail (Phase 7): an ordered, gap-free stream of committed mutations from
+     * {@code fromSequence} onward. History still in the ring replays first, then live events stream
+     * as they commit — delivered on a tail thread, off the store lock, so a slow listener never
+     * stalls the writer (it drops oldest and is told via {@link TailListener#onGap()}). Close the
+     * returned handle to unsubscribe.
+     */
+    public AutoCloseable tail(long fromSequence, TailListener<K, V> listener) {
+        Objects.requireNonNull(listener, "listener");
+        return tailStream.subscribe(fromSequence, listener);
+    }
+
+    /** The next sequence the tail will assign — the number of mutations committed since this open. */
+    public long tailSequence() {
+        return tailStream.nextSequence();
+    }
+
     /** A one-line health/shape summary, including the control plane's own report. */
     public String stats() {
         try {
@@ -942,6 +965,7 @@ public final class SmokeHouse<K, V> implements Closeable {
                 return;
             }
             closed = true;
+            tailStream.close();
             log.force();
             try {
                 HintFile.write(log.hintPath(), indexInOrder(), log.activeSegmentId(),
