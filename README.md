@@ -93,6 +93,13 @@ anything, because compaction always covers a full prefix of the log: nothing old
 Reads continue during the copy; a read overlapping the commit retries once against the
 repointed index.
 
+**Backup and restore that reuse recovery.** `backup(targetDir)` writes a self-contained, restorable
+copy: under the store lock it forces the log, copies each segment's immutable prefix while CRC-ing
+it, and drops a generation-numbered **manifest** naming the copied set. Restore is just
+`open(targetDir)` — a backup is only recovery's input, relocated, so nothing new has to be trusted.
+The manifest is advisory like the hint (missing or corrupt → simply not used); retained generations
+are point-in-time markers. Writes taken after the call never leak into the copy.
+
 **A retention tier.** `retainNewest(n)` keeps only the newest-written N keys — CSRBT's FIFO
 window does the evicting (upserts re-enter at the tail, so eviction order is write order), and
 evictions fund the garbage ledger with no tombstones needed: recovery re-derives newest-N from
@@ -199,10 +206,10 @@ set into a map through public API only, the compaction crash windows, and every 
 Its four phases (core store, durability + compaction, ingestion, the index ring + dashboard) are
 all complete.
 
-The successor ADR carries what comes next. Measurement has **landed** (see Benchmarks above — the
-JMH suite is in and the §D1 seam is decided by number); still ahead are crash-fuzz hardening, an
-advisory manifest, backup/restore, a log-tail primitive feeding watchers and snapshots,
-tail-shipped read replicas, and Maven Central release:
+The successor ADR carries what comes next. Measurement and durability hardening have **landed** —
+the JMH suite (Benchmarks above, §D1 seam decided by number), an append/torn-tail crash-fuzz
+harness, an advisory segment manifest, and backup/restore; still ahead are a log-tail primitive
+feeding watchers and snapshots, tail-shipped read replicas, and Maven Central release:
 [`SuperBeefSort/docs/adr-ecosystem-outer-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-ecosystem-outer-ring.md).
 
 ## License
