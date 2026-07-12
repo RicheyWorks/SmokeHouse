@@ -76,6 +76,37 @@ final class ManifestFile {
         return crc.getValue();
     }
 
+    /** Copy the first {@code length} bytes of {@code src} into a fresh {@code dst}, returning their CRC32. */
+    static long copyPrefix(Path src, Path dst, long length) throws IOException {
+        CRC32 crc = new CRC32();
+        ByteBuffer buf = ByteBuffer.allocate(1 << 16);
+        try (FileChannel in = FileChannel.open(src, StandardOpenOption.READ);
+             FileChannel out = FileChannel.open(dst, StandardOpenOption.CREATE,
+                     StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            long remaining = length;
+            long pos = 0;
+            while (remaining > 0) {
+                buf.clear();
+                if (remaining < buf.capacity()) {
+                    buf.limit((int) remaining);
+                }
+                int n = in.read(buf, pos);
+                if (n < 0) {
+                    break;
+                }
+                buf.flip();
+                crc.update(buf.duplicate());               // CRC the chunk without disturbing the write
+                while (buf.hasRemaining()) {
+                    out.write(buf);
+                }
+                pos += n;
+                remaining -= n;
+            }
+            out.force(true);                               // a backup should be durable
+        }
+        return crc.getValue();
+    }
+
     /** Write {@code m} as {@code manifest-<gen>} in {@code dir}, atomically (temp + ATOMIC_MOVE). */
     static void write(Path dir, Manifest m) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(24 + m.segments().size() * ENTRY_BYTES);
@@ -158,6 +189,12 @@ final class ManifestFile {
         }
         gens.sort(null);
         return gens;
+    }
+
+    /** One past the highest manifest generation present in {@code dir} (monotonic even past a corrupt one). */
+    static long nextGeneration(Path dir) throws IOException {
+        List<Long> gens = generations(dir);
+        return gens.isEmpty() ? 1 : gens.get(gens.size() - 1) + 1;
     }
 
     /** The highest-generation valid manifest in {@code dir}, or {@code null} (a corrupt latest is skipped). */

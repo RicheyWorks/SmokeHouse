@@ -31,6 +31,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -826,11 +827,57 @@ public final class SmokeHouse<K, V> implements Closeable {
                 long size = log.segmentSize(id);
                 entries.add(new ManifestFile.SegmentEntry(id, size, ManifestFile.crcOf(log.segmentPath(id), size)));
             }
-            List<Long> gens = ManifestFile.generations(dir);
-            long generation = gens.isEmpty() ? 1 : gens.get(gens.size() - 1) + 1;
+            long generation = ManifestFile.nextGeneration(dir);
             ManifestFile.write(dir, new ManifestFile.Manifest(generation, entries));
             return generation;
         }
+    }
+
+    /**
+     * Back the store up into {@code targetDir}: a self-contained, restorable copy of the current
+     * state. Runs under the store lock, so the segment set and its byte lengths are one consistent
+     * instant and no compaction can reclaim a segment mid-copy — it forces the log durable, copies
+     * each segment's immutable prefix (CRCing as it goes), and writes the same manifest generation
+     * into both the source (the point-in-time record) and the target (so the backup is
+     * self-describing and {@link ManifestFile#verify verifiable}). Mutations after this call cannot
+     * leak into the copy: only bytes already written are captured.
+     *
+     * <p>Restore is just {@link #restore}/{@link #open(Path, SmokeHouseOptions) open} on
+     * {@code targetDir} — recovery rebuilds everything from the segments, so a backup is only
+     * recovery's input, relocated.</p>
+     *
+     * <p>Phase 6 copies under the lock for correctness; the off-lock copy the ADR envisions needs
+     * Phase 7's snapshot pinning to keep compaction from reclaiming a segment out from under it.</p>
+     *
+     * @return the manifest generation written
+     */
+    public long backup(Path targetDir) throws IOException {
+        synchronized (lock) {
+            log.force();
+            Path sourceDir = log.directory();
+            Files.createDirectories(targetDir);
+            long generation = ManifestFile.nextGeneration(sourceDir);
+            List<ManifestFile.SegmentEntry> entries = new ArrayList<>();
+            for (int id : log.segmentIds()) {
+                long len = log.segmentSize(id);
+                long crc = ManifestFile.copyPrefix(log.segmentPath(id),
+                        targetDir.resolve(SegmentLog.segmentName(id)), len);
+                entries.add(new ManifestFile.SegmentEntry(id, len, crc));
+            }
+            ManifestFile.Manifest m = new ManifestFile.Manifest(generation, entries);
+            ManifestFile.write(sourceDir, m);
+            ManifestFile.write(targetDir, m);
+            return generation;
+        }
+    }
+
+    /**
+     * Restore a {@link #backup(Path)} — literally {@link #open(Path, SmokeHouseOptions) open} on the
+     * backup directory, named for the round-trip's sake. Recovery does all the work.
+     */
+    public static <K, V> SmokeHouse<K, V> restore(Path backupDir, SmokeHouseOptions<K, V> opts)
+            throws IOException {
+        return open(backupDir, opts);
     }
 
     /** A one-line health/shape summary, including the control plane's own report. */
