@@ -139,6 +139,31 @@ Read these before depending on it (they're the ADR's explicit trades, not accide
   it and stream the log outside it). That's a contract inherited from the control plane, not a
   temporary limitation.
 
+## Benchmarks
+
+A JMH suite (`src/jmh`, `./gradlew jmh`) measures the store the way the ADR insists — *before*
+cutting any performance seam. It's seeded and shape-parameterized (uniform, sequential, skewed key
+distributions) across point read, upsert, range scan, cold build, warm recovery, and full
+compaction. Representative figures at 100 000 keys with a Red-Black index (your hardware will
+differ):
+
+| Operation | Cost |
+|---|---|
+| `get` (point read) | ~6 µs |
+| `upsert` (overwrite) | ~5 µs |
+| `range` scan (128 keys) | ~0.5 ms |
+| cold `build` (100k puts) | ~0.5 s |
+| warm `recover` (reopen) | ~25 ms |
+| full `compact` | ~0.9 s |
+
+Measuring first has already earned its keep. It caught a warm-recovery ordering bug that only bit
+above 65 536 keys — recovery deduped into a `HashMap`, whose iteration is only accidentally sorted
+below 2¹⁶ (now a `TreeMap`: fixed and regression-tested). And it settled the first design seam
+(ADR §D1): the CSRBT `replace` seam stays **uncut**, because an upsert's index work (`remove`+`add`,
+~817 ns) is only ~15% of the end-to-end upsert — the log append and fsync dominate, exactly as
+predicted. The same run flagged the honest next target: `get` costs *more* than `upsert`, so reads
+are syscall-bound and memory-mapped segment reads, not micro-allocation tweaks, are the lever.
+
 ## Build
 
 ```bash
@@ -174,9 +199,10 @@ set into a map through public API only, the compaction crash windows, and every 
 Its four phases (core store, durability + compaction, ingestion, the index ring + dashboard) are
 all complete.
 
-What comes next — benchmarking and the measured performance seams, crash-fuzz hardening,
-backup/restore, a log-tail primitive feeding watchers and snapshots, tail-shipped read replicas,
-and Maven Central release — is the successor ADR:
+The successor ADR carries what comes next. Measurement has **landed** (see Benchmarks above — the
+JMH suite is in and the §D1 seam is decided by number); still ahead are crash-fuzz hardening, an
+advisory manifest, backup/restore, a log-tail primitive feeding watchers and snapshots,
+tail-shipped read replicas, and Maven Central release:
 [`SuperBeefSort/docs/adr-ecosystem-outer-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-ecosystem-outer-ring.md).
 
 ## License
