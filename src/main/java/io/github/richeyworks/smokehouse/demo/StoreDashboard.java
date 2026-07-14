@@ -81,7 +81,18 @@ public final class StoreDashboard {
     }
 
     public static void main(String[] args) throws Exception {
-        new StoreDashboard().start();
+        // Tier is selectable so the ensemble-backed tiers are showable live, not just testable:
+        //   ./gradlew run --args="ENSEMBLE"     (or STATIC / ADAPTIVE / EVOLUTION;
+        //   -Dsmokehouse.tier=... works too; default ADAPTIVE, the classic exhibit)
+        String pick = args.length > 0 ? args[0] : System.getProperty("smokehouse.tier", "ADAPTIVE");
+        new StoreDashboard(SmokeHouseOptions.IndexTier.valueOf(pick.trim().toUpperCase(java.util.Locale.ROOT)))
+                .start();
+    }
+
+    private final SmokeHouseOptions.IndexTier tier;
+
+    private StoreDashboard(SmokeHouseOptions.IndexTier tier) {
+        this.tier = tier;
     }
 
     private void start() throws IOException {
@@ -89,7 +100,7 @@ public final class StoreDashboard {
         store = SmokeHouse.open(dir, SmokeHouseOptions
                 .of(SpillSerializer.forLongs(), SpillSerializer.forStrings())
                 .segmentBytes(128 << 10)                   // small segments: a lively map
-                .indexTier(SmokeHouseOptions.IndexTier.ADAPTIVE)
+                .indexTier(tier)
                 .pilotCadence(Duration.ofSeconds(2))
                 .compactWhenGarbageAbove(0.0));            // manual: the button owns the money shot
         stockRegimes();
@@ -114,7 +125,8 @@ public final class StoreDashboard {
         });
         ticker.scheduleAtFixedRate(this::tick, 500, 1_000, TimeUnit.MILLISECONDS);
 
-        System.out.println("SmokeHouse dashboard: http://127.0.0.1:" + PORT + "/   (store in " + dir + ")");
+        System.out.println("SmokeHouse dashboard: http://127.0.0.1:" + PORT + "/   (tier=" + tier
+                + ", store in " + dir + ")");
         drive();                                           // blocks forever on the single writer thread
     }
 
@@ -180,11 +192,22 @@ public final class StoreDashboard {
                 first = false;
             }
             segs.append(']');
+            // Probe depth of the median live key: CSRBT's searchDepth made visible — watch it
+            // drop when the pilot morphs the index under a skewed regime. Read-path, off-thread
+            // safe; ensemble tiers may report 0 (unmeasured stride) — the UI shows a dash.
+            int depth = 0;
+            Long median = store.medianKey();
+            if (median != null) {
+                int d = store.searchDepth(median);
+                depth = (d >= 0) ? d : ~d;
+            }
             publish("{\"t\":\"stats\",\"keys\":" + store.size()
                     + ",\"garbage\":" + store.garbageBytes()
                     + ",\"puts\":" + puts.get() + ",\"gets\":" + gets.get()
                     + ",\"deletes\":" + deletes.get()
                     + ",\"running\":" + workloadOn.get()
+                    + ",\"tier\":\"" + tier + "\""
+                    + ",\"depth\":" + depth
                     + ",\"regime\":\"" + esc(regimeName) + "\""
                     + ",\"line\":\"" + esc(store.stats()) + "\""
                     + ",\"segments\":" + segs + "}");

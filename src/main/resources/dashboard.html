@@ -54,6 +54,8 @@
   <div class="chip"><b id="deletes">–</b><span>deletes</span></div>
   <div class="chip"><b id="garbage">–</b><span>garbage</span></div>
   <div class="chip"><b id="segcount">–</b><span>segments</span></div>
+  <div class="chip"><b id="depth">–</b><span>probe depth</span></div>
+  <div class="chip"><b id="tier">–</b><span>index tier</span></div>
   <div class="chip"><b id="regime">–</b><span>regime</span></div>
 </div>
 
@@ -130,6 +132,8 @@ es.onmessage = ev => {
     $('gets').textContent = fmtN(m.gets);
     $('deletes').textContent = fmtN(m.deletes);
     $('garbage').textContent = fmtB(m.garbage);
+    $('depth').textContent = m.depth > 0 ? m.depth : '–';   // 0 = unmeasured (ensemble voted stride)
+    $('tier').textContent = m.tier;
     $('regime').textContent = m.regime;
     $('line').textContent = m.line;
     drawSegments(m.segments);

@@ -700,6 +700,23 @@ public final class SmokeHouse<K, V> implements Closeable {
     }
 
     /**
+     * The realized index probe depth for {@code key} — CSRBT's measuring read surfaced through the
+     * store (the store already samples it internally to feed the pilot; this makes the same signal
+     * observable, e.g. on a dashboard). Encoding matches {@code OrderedSet.searchDepth}: nodes
+     * touched ({@code ≥ 1}) when the key is live, the bitwise complement {@code ~depth} (negative)
+     * when absent; ensemble-backed tiers may return the unmeasured encoding {@code 0}/{@code ~0}
+     * on reads that have no single measurable walk (e.g. a voted VERIFIED stride). Read-path only:
+     * never splays, never mutates.
+     */
+    public int searchDepth(K key) {
+        Objects.requireNonNull(key, "key");
+        synchronized (lock) {
+            return (ensemble != null) ? ensemble.searchDepth(IndexEntry.probe(key))
+                                      : index.searchDepth(IndexEntry.probe(key));
+        }
+    }
+
+    /**
      * Compaction (Phase 2): merge every closed segment into one key-ordered segment containing
      * exactly the live records, reclaiming all dead bytes in them. The copy runs outside the
      * store lock (closed segments are immutable); the commit + index repoint run under it, with
