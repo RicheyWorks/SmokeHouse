@@ -47,3 +47,9 @@ terminal (PowerShell). Stale `.git/index.lock` fix: `Remove-Item .git\index.lock
   `start → end → keys`; the tag is an upper bound so pruning never loses a match, the sidecar
   makes duplicate starts/spans exact. Extractors validate BEFORE the primary write. Brute-force
   oracle in `IntervalIndexTest`.
+- Typed interval tier (Phase 7): `.interval(name, order, start, end)` overload — same semantics
+  over comparator-ordered endpoints (epoch-millis `Long`s etc.), backed by CSRBT's
+  `GenericIntervalAugmentor` + a `TreeMap` sidecar (no `hashCode` contract, only
+  equals-agrees-with-comparator). Typed `stab`/`overlapping` overloads; int calls on a typed
+  index (and vice versa) fail loudly with cross-referencing messages. Oracle in
+  `GenericIntervalIndexTest`.
