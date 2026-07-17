@@ -55,3 +55,8 @@ jmh {
     resultsFile = layout.buildDirectory.file("reports/jmh/results.json")
     // includes = listOf("IndexUpsertBenchmark")   // e.g. the fast D1 seam run (~2 min, skips the store single-shots)
 }
+
+// The jmh plugin doesn't hook the jmh source set into `build`/`check`, so a compile
+// break in a benchmark would only surface at the next manual jmh run. Feed it in.
+// (Mirrors csrbt-benchmarks and SuperBeefSort.)
+tasks.named("check") { dependsOn(tasks.named("compileJmhJava")) }

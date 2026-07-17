@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # SmokeHouse composite-builds against ../SuperBeefSort, which itself composite-builds
+      # against ../CSRBT, so all three repos are checked out as siblings inside the workspace
+      # and Gradle is run from the SmokeHouse subdirectory.
+      - name: Check out SmokeHouse
+        uses: actions/checkout@v4
+        with:
+          path: SmokeHouse
+
+      - name: Check out SuperBeefSort (sibling, for the composite build)
+        uses: actions/checkout@v4
+        with:
+          repository: RicheyWorks/SuperBeefSort
+          path: SuperBeefSort
+
+      - name: Check out CSRBT (sibling, for the nested composite build)
+        uses: actions/checkout@v4
+        with:
+          repository: RicheyWorks/CSRBT
+          path: CSRBT
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build and test
+        working-directory: SmokeHouse
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon --stacktrace
