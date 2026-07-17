@@ -2,6 +2,7 @@ package io.github.richeyworks.smokehouse;
 
 import io.github.richeyworks.csrbt.OrderedSet;
 import io.github.richeyworks.csrbt.TreeContext;
+import io.github.richeyworks.csrbt.augment.GenericIntervalAugmentor;
 import io.github.richeyworks.csrbt.augment.IntervalAugmentor;
 import io.github.richeyworks.csrbt.strategy.RedBlackStrategy;
 import io.github.richeyworks.superbeefsort.BeefSort;
@@ -32,7 +33,11 @@ import java.util.function.ToIntFunction;
  *
  * <p><b>Interval indexes</b> ({@link Builder#interval}): for records exposing an
  * {@code (int start, int end)} span (epoch minutes/seconds and the like — CSRBT's
- * {@link IntervalAugmentor} is deliberately {@code Integer}-bound in v1). Each is a CSRBT
+ * {@link IntervalAugmentor} was deliberately {@code Integer}-bound in v1; the
+ * {@link Builder#interval(String, Comparator, Function, Function)} overload lifts spans to
+ * TYPED endpoints via {@link GenericIntervalAugmentor} — epoch-millis {@code Long}s,
+ * {@code Instant}s, anything with a total order — with identical semantics and its own
+ * typed {@code stab}/{@code overlapping} overloads). Each is a CSRBT
  * interval tree (CLRS 14.3): distinct start points are the keys, the node tag carries the
  * <em>maximum</em> end among live spans sharing that start, and the augmentor maintains
  * subtree max-end for pruned search. An exact sidecar (start → end → keys) resolves the
@@ -64,13 +69,16 @@ public final class IndexedStore<K, V> implements Closeable {
     private final SmokeHouse<K, V> store;
     private final Map<String, Secondary<K, V>> secondaries;            // insertion-ordered
     private final Map<String, IntervalSecondary<K, V>> intervals;      // insertion-ordered
+    private final Map<String, GenericIntervalSecondary<K, V, ?>> genericIntervals; // insertion-ordered
 
     private IndexedStore(SmokeHouse<K, V> store,
                          LinkedHashMap<String, Secondary<K, V>> secondaries,
-                         LinkedHashMap<String, IntervalSecondary<K, V>> intervals) {
+                         LinkedHashMap<String, IntervalSecondary<K, V>> intervals,
+                         LinkedHashMap<String, GenericIntervalSecondary<K, V, ?>> genericIntervals) {
         this.store = store;
         this.secondaries = secondaries;
         this.intervals = intervals;
+        this.genericIntervals = genericIntervals;
     }
 
     /** Start building an indexed store over {@code dir}; declare indexes, then {@link Builder#build()}. */
@@ -84,6 +92,8 @@ public final class IndexedStore<K, V> implements Closeable {
         private final SmokeHouseOptions<K, V> opts;
         private final LinkedHashMap<String, Secondary<K, V>> secondaries = new LinkedHashMap<>();
         private final LinkedHashMap<String, IntervalSecondary<K, V>> intervals = new LinkedHashMap<>();
+        private final LinkedHashMap<String, GenericIntervalSecondary<K, V, ?>> genericIntervals =
+                new LinkedHashMap<>();
 
         private Builder(Path dir, SmokeHouseOptions<K, V> opts) {
             this.dir = dir;
@@ -118,9 +128,30 @@ public final class IndexedStore<K, V> implements Closeable {
             return this;
         }
 
+        /**
+         * Declare an interval index over TYPED endpoints (Phase 7: "generic interval endpoints"
+         * — epoch-millis {@code Long}s, {@code Instant}s, anything {@code order} can rank).
+         * Same closed-span semantics as the {@code int} version ({@code start(v) <= end(v)},
+         * enforced on every write); backed by CSRBT's {@link GenericIntervalAugmentor}. The
+         * endpoint type's {@code equals} must agree with {@code order} (the same discipline
+         * attributes already obey). Query with the typed {@link #stab(String, Object)} and
+         * {@link #overlapping(String, Object, Object)} overloads.
+         */
+        public <P> Builder<K, V> interval(String name, Comparator<P> order,
+                                          Function<V, P> start, Function<V, P> end) {
+            Objects.requireNonNull(order, "order");
+            Objects.requireNonNull(start, "start");
+            Objects.requireNonNull(end, "end");
+            reserve(name);
+            genericIntervals.put(name,
+                    new GenericIntervalSecondary<>(name, order, start, end, opts.comparator()));
+            return this;
+        }
+
         private void reserve(String name) {
             Objects.requireNonNull(name, "name");
-            if (secondaries.containsKey(name) || intervals.containsKey(name)) {
+            if (secondaries.containsKey(name) || intervals.containsKey(name)
+                    || genericIntervals.containsKey(name)) {
                 throw new IllegalArgumentException("duplicate index name: " + name);
             }
         }
@@ -132,7 +163,8 @@ public final class IndexedStore<K, V> implements Closeable {
          *         indexes are declared (evictions would bypass this class — see class javadoc)
          */
         public IndexedStore<K, V> build() throws IOException {
-            if (opts.retention() > 0 && !(secondaries.isEmpty() && intervals.isEmpty())) {
+            if (opts.retention() > 0 && !(secondaries.isEmpty() && intervals.isEmpty()
+                    && genericIntervals.isEmpty())) {
                 throw new IllegalArgumentException("retainNewest > 0 is incompatible with "
                         + "IndexedStore indexes in v1: retention evictions happen inside the "
                         + "primary index and bypass IndexedStore, so derived indexes would "
@@ -147,11 +179,14 @@ public final class IndexedStore<K, V> implements Closeable {
                 for (IntervalSecondary<K, V> s : intervals.values()) {
                     s.rebuild(store);
                 }
+                for (GenericIntervalSecondary<K, V, ?> s : genericIntervals.values()) {
+                    s.rebuild(store);
+                }
             } catch (IOException | RuntimeException rebuildFailed) {
                 store.close();
                 throw rebuildFailed;
             }
-            return new IndexedStore<>(store, secondaries, intervals);
+            return new IndexedStore<>(store, secondaries, intervals, genericIntervals);
         }
     }
 
@@ -167,7 +202,8 @@ public final class IndexedStore<K, V> implements Closeable {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         synchronized (lock) {
-            boolean indexed = !(secondaries.isEmpty() && intervals.isEmpty());
+            boolean indexed = !(secondaries.isEmpty() && intervals.isEmpty()
+                    && genericIntervals.isEmpty());
             V old = indexed ? store.get(key) : null;
 
             // Validate-first: compute the whole new fan-out before touching the primary.
@@ -178,6 +214,9 @@ public final class IndexedStore<K, V> implements Closeable {
             List<int[]> spanAdds = new ArrayList<>(intervals.size());
             for (IntervalSecondary<K, V> s : intervals.values()) {
                 spanAdds.add(s.span(value, key));
+            }
+            for (GenericIntervalSecondary<K, V, ?> s : genericIntervals.values()) {
+                s.validate(value, key);        // extractors are pure by contract; recomputed below
             }
 
             store.put(key, value);                                     // truth before every cache
@@ -197,6 +236,12 @@ public final class IndexedStore<K, V> implements Closeable {
                 int[] span = spanAdds.get(i++);
                 s.add(span[0], span[1], key);
             }
+            for (GenericIntervalSecondary<K, V, ?> s : genericIntervals.values()) {
+                if (old != null) {
+                    s.remove(old, key);
+                }
+                s.insertFrom(value, key);      // pure extractors ⇒ identical to the validated span
+            }
         }
     }
 
@@ -204,7 +249,8 @@ public final class IndexedStore<K, V> implements Closeable {
     public boolean delete(K key) throws IOException {
         Objects.requireNonNull(key, "key");
         synchronized (lock) {
-            boolean indexed = !(secondaries.isEmpty() && intervals.isEmpty());
+            boolean indexed = !(secondaries.isEmpty() && intervals.isEmpty()
+                    && genericIntervals.isEmpty());
             V old = indexed ? store.get(key) : null;
             boolean existed = store.delete(key);
             if (old != null) {
@@ -212,6 +258,9 @@ public final class IndexedStore<K, V> implements Closeable {
                     s.set.remove(s.entry(old, key));
                 }
                 for (IntervalSecondary<K, V> s : intervals.values()) {
+                    s.remove(old, key);
+                }
+                for (GenericIntervalSecondary<K, V, ?> s : genericIntervals.values()) {
                     s.remove(old, key);
                 }
             }
@@ -280,13 +329,65 @@ public final class IndexedStore<K, V> implements Closeable {
         }
     }
 
+    /**
+     * Every primary key whose typed {@code name} span contains {@code point} — the generic
+     * counterpart of {@link #stab(String, int)}, for indexes declared via the
+     * {@link Builder#interval(String, Comparator, Function, Function)} overload. Results
+     * ordered by (start, end, key) under the index's endpoint ordering.
+     *
+     * @throws IllegalArgumentException if no generic interval index named {@code name} exists
+     * @throws ClassCastException if {@code point} is not the index's declared endpoint type
+     */
+    public <P> List<K> stab(String name, P point) {
+        GenericIntervalSecondary<K, V, P> s = genericIntervalIndex(name);
+        Objects.requireNonNull(point, "point");
+        synchronized (lock) {
+            return s.stab(point);
+        }
+    }
+
+    /**
+     * Every primary key whose typed {@code name} span overlaps {@code [lo, hi]} (closed;
+     * overlap = {@code start <= hi && end >= lo} under the index's ordering) — the generic
+     * counterpart of {@link #overlapping(String, int, int)}.
+     *
+     * @throws IllegalArgumentException if no generic interval index named {@code name} exists,
+     *         or {@code lo} sorts after {@code hi}
+     * @throws ClassCastException if the endpoints are not the index's declared endpoint type
+     */
+    public <P> List<K> overlapping(String name, P lo, P hi) {
+        GenericIntervalSecondary<K, V, P> s = genericIntervalIndex(name);
+        Objects.requireNonNull(lo, "lo");
+        Objects.requireNonNull(hi, "hi");
+        if (s.order.compare(lo, hi) > 0) {
+            throw new IllegalArgumentException("lo " + lo + " sorts after hi " + hi);
+        }
+        synchronized (lock) {
+            return s.overlapping(lo, hi);
+        }
+    }
+
     private IntervalSecondary<K, V> intervalIndex(String name) {
         IntervalSecondary<K, V> s = intervals.get(name);
         if (s == null) {
-            throw new IllegalArgumentException("no interval index named '" + name
-                    + "'; declared: " + intervals.keySet());
+            throw new IllegalArgumentException("no int interval index named '" + name
+                    + "'; declared int: " + intervals.keySet()
+                    + ", generic: " + genericIntervals.keySet()
+                    + " (typed indexes take the typed stab/overlapping overloads)");
         }
         return s;
+    }
+
+    @SuppressWarnings("unchecked")   // one map holds many P's; the comparator re-checks at use
+    private <P> GenericIntervalSecondary<K, V, P> genericIntervalIndex(String name) {
+        GenericIntervalSecondary<K, V, ?> s = genericIntervals.get(name);
+        if (s == null) {
+            throw new IllegalArgumentException("no generic interval index named '" + name
+                    + "'; declared generic: " + genericIntervals.keySet()
+                    + ", int: " + intervals.keySet()
+                    + " (int indexes take the int stab/overlapping overloads)");
+        }
+        return (GenericIntervalSecondary<K, V, P>) s;
     }
 
     /**
@@ -443,6 +544,119 @@ public final class IndexedStore<K, V> implements Closeable {
                 int[] s = span(v, k);
                 add(s[0], s[1], k);
             });
+        }
+    }
+
+    /**
+     * The typed-endpoint interval index (Phase 7) — the same shape as {@link IntervalSecondary}
+     * with every {@code int} generalized to {@code P} under one {@link Comparator}: a CSRBT
+     * tree over distinct start points via {@link GenericIntervalAugmentor} (subtree max-end in
+     * the generic ref slot), plus the exact sidecar {@code start → end → keys}. The sidecar is
+     * a {@code TreeMap} ordered by the same comparator, so endpoint types need no
+     * {@code hashCode} discipline — only {@code equals} agreeing with {@code order}.
+     */
+    private static final class GenericIntervalSecondary<K, V, P> {
+        final String name;
+        final Comparator<? super P> order;
+        final Function<V, P> startOf;
+        final Function<V, P> endOf;
+        final Comparator<? super K> keyOrder;
+        final GenericIntervalAugmentor<P> augmentor;
+        final OrderedSet<P> tree;
+        final TreeMap<P, TreeMap<P, TreeSet<K>>> byStart;
+
+        GenericIntervalSecondary(String name, Comparator<? super P> order,
+                                 Function<V, P> startOf, Function<V, P> endOf,
+                                 Comparator<? super K> keyOrder) {
+            this.name = name;
+            this.order = order;
+            this.startOf = startOf;
+            this.endOf = endOf;
+            this.keyOrder = keyOrder;
+            this.augmentor = GenericIntervalAugmentor.over(order);
+            this.tree = new OrderedSet<>(new RedBlackStrategy<>(), order);
+            this.byStart = new TreeMap<>(order);
+        }
+
+        /** Extract + validate the span BEFORE the primary write (extractors must be pure). */
+        void validate(V value, K key) {
+            requireSpan(startOf.apply(value), endOf.apply(value), key);
+        }
+
+        private void requireSpan(P lo, P hi, K key) {
+            if (lo == null || hi == null) {
+                throw new IllegalArgumentException("interval '" + name
+                        + "': null endpoint for key " + key);
+            }
+            if (order.compare(lo, hi) > 0) {
+                throw new IllegalArgumentException("interval '" + name + "': start " + lo
+                        + " sorts after end " + hi + " for key " + key);
+            }
+        }
+
+        /** Re-extract (pure by contract) and insert — sidecar first, then tree stamp. */
+        void insertFrom(V value, K key) {
+            P lo = startOf.apply(value);
+            P hi = endOf.apply(value);
+            requireSpan(lo, hi, key);
+            TreeMap<P, TreeSet<K>> ends = byStart.computeIfAbsent(lo, x -> new TreeMap<>(order));
+            ends.computeIfAbsent(hi, x -> new TreeSet<>(keyOrder)).add(key);
+            // (Re-)stamp this start with its max end; insertInterval is add-or-restamp.
+            augmentor.insertInterval(tree, lo, ends.lastKey());
+        }
+
+        void remove(V oldValue, K key) {
+            P lo = startOf.apply(oldValue);
+            P hi = endOf.apply(oldValue);
+            TreeMap<P, TreeSet<K>> ends = byStart.get(lo);
+            if (ends == null) {
+                return;
+            }
+            TreeSet<K> keys = ends.get(hi);
+            if (keys == null || !keys.remove(key)) {
+                return;
+            }
+            if (keys.isEmpty()) {
+                ends.remove(hi);
+            }
+            if (ends.isEmpty()) {
+                byStart.remove(lo);
+                tree.remove(lo);                                       // last span at this start
+            } else {
+                augmentor.insertInterval(tree, lo, ends.lastKey());    // max end may have dropped
+            }
+        }
+
+        List<K> stab(P point) {
+            return resolve(augmentor.stabQuery(tree, point), point);
+        }
+
+        List<K> overlapping(P qlo, P qhi) {
+            return resolve(augmentor.intervalSearchAll(tree, qlo, qhi), qlo);
+        }
+
+        /** Candidate starts → exact keys through the sidecar, ordered by (start, end, key). */
+        private List<K> resolve(List<GenericIntervalAugmentor.Interval<P>> candidates, P minEnd) {
+            candidates.sort((a, b) -> order.compare(a.lo(), b.lo()));
+            List<K> out = new ArrayList<>();
+            for (GenericIntervalAugmentor.Interval<P> c : candidates) {
+                TreeMap<P, TreeSet<K>> ends = byStart.get(c.lo());
+                if (ends == null) {
+                    continue;
+                }
+                for (TreeSet<K> keys : ends.tailMap(minEnd, true).values()) {
+                    out.addAll(keys);
+                }
+            }
+            return out;
+        }
+
+        /** Full primary sweep → per-span insert, exactly like the int version. */
+        void rebuild(SmokeHouse<K, V> store) throws IOException {
+            if (store.size() == 0) {
+                return;
+            }
+            store.range(store.firstKey(), store.lastKey(), (k, v) -> insertFrom(v, k));
         }
     }
 
