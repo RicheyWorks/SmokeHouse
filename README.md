@@ -266,6 +266,12 @@ the Maven Central release itself:
 | [Renderer](https://github.com/RicheyWorks/Renderer) | the materialized-view engine — folds the tail into live aggregates |
 | [Brine](https://github.com/RicheyWorks/Brine) | the adaptive cache — invalidation rides this store's tail |
 
+Engines 7–11 all compose over this store: [PitBoss](https://github.com/RicheyWorks/PitBoss)
+conducts its replica fleet, [DryAge](https://github.com/RicheyWorks/DryAge) time-travels its
+backups, [Twine](https://github.com/RicheyWorks/Twine) ties crash-atomic batches over its
+puts, [SmokeSignal](https://github.com/RicheyWorks/SmokeSignal) puts it on a loopback wire,
+and [Jerky](https://github.com/RicheyWorks/Jerky) dries its backups for cold storage.
+
 ## License
 
 MIT.
