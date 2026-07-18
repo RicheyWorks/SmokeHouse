@@ -47,6 +47,14 @@ terminal (PowerShell). Stale `.git/index.lock` fix: `Remove-Item .git\index.lock
   `start → end → keys`; the tag is an upper bound so pruning never loses a match, the sidecar
   makes duplicate starts/spans exact. Extractors validate BEFORE the primary write. Brute-force
   oracle in `IntervalIndexTest`.
+- Replication (Phase 8, D3 option A): `ReplicationServer.serve(store, opts)` + `Replica.connect(dir,
+  opts, port)` — loopback JDK socket, zero-dep. Protocol per client: subscribe tail → buffer →
+  backup → ship segments → flush buffer → live frames (keys/values via the options'
+  `SpillSerializer`s). Overlap replays are harmless (replica applies via its own put/delete =
+  last-writer-wins). A replica IS a SmokeHouse (all tiers/reads work; its dir reopens as a plain
+  store = manual promotion). Gapped replica stops applying, stays consistently stale; re-connect
+  to re-bootstrap. NO failover, NO write forwarding, NO consensus — v1 non-goals, on the record.
+  Oracle in `ReplicationTest`.
 - Typed interval tier (Phase 7): `.interval(name, order, start, end)` overload — same semantics
   over comparator-ordered endpoints (epoch-millis `Long`s etc.), backed by CSRBT's
   `GenericIntervalAugmentor` + a `TreeMap` sidecar (no `hashCode` contract, only
