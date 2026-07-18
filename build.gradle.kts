@@ -1,6 +1,7 @@
 plugins {
     `java-library`
     application
+    `maven-publish`   // Phase 9: local repo today; Central rides csrbt-core's release
     alias(libs.plugins.jmh)
 }
 
@@ -60,3 +61,34 @@ jmh {
 // break in a benchmark would only surface at the next manual jmh run. Feed it in.
 // (Mirrors csrbt-benchmarks and SuperBeefSort.)
 tasks.named("check") { dependsOn(tasks.named("compileJmhJava")) }
+
+// Phase 9 (outer-ring ADR): make the ring locally installable — ./gradlew publishToMavenLocal.
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            artifactId = "smokehouse"
+            from(components["java"])
+            pom {
+                name = "SmokeHouse"
+                description = "A log-structured record store with CSRBT as its adaptive primary index and SuperBeefSort as its recovery engine."
+                url = "https://github.com/RicheyWorks/SmokeHouse"
+                licenses {
+                    license {
+                        name = "MIT License"
+                        url = "https://opensource.org/licenses/MIT"
+                    }
+                }
+                developers {
+                    developer {
+                        id = "RicheyWorks"
+                        name = "Richmond"
+                    }
+                }
+                scm {
+                    url = "https://github.com/RicheyWorks/SmokeHouse"
+                    connection = "scm:git:https://github.com/RicheyWorks/SmokeHouse.git"
+                }
+            }
+        }
+    }
+}
