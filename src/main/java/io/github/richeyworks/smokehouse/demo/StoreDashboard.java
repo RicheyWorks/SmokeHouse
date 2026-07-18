@@ -2,6 +2,8 @@ package io.github.richeyworks.smokehouse.demo;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.github.richeyworks.smokehouse.Replica;
+import io.github.richeyworks.smokehouse.ReplicationServer;
 import io.github.richeyworks.smokehouse.SmokeHouse;
 import io.github.richeyworks.smokehouse.SmokeHouseOptions;
 import io.github.richeyworks.superbeefsort.external.SpillSerializer;
@@ -59,6 +61,12 @@ public final class StoreDashboard {
 
     private SmokeHouse<Long, String> store;
 
+    // ── The replica panel (Phase 8's exhibit): spawn, watch lag, kill, re-bootstrap ─────────
+    private ReplicationServer<Long, String> replicationServer;
+    private final Object replicaLock = new Object();       // HTTP threads race the buttons
+    private volatile Replica<Long, String> replica;        // null = no replica on exhibit
+    private Path replicaDir;
+
     /** One workload regime: a key stream plus a read/delete mix, played for {@code ops} operations. */
     private record Regime(String name, int ops, double readFraction, double deleteFraction,
                           IntSupplier keys) { }
@@ -95,14 +103,20 @@ public final class StoreDashboard {
         this.tier = tier;
     }
 
-    private void start() throws IOException {
-        Path dir = Files.createTempDirectory("smokehouse-dashboard");
-        store = SmokeHouse.open(dir, SmokeHouseOptions
+    /** Fresh options per store — primary and replica each get their own instance. */
+    private SmokeHouseOptions<Long, String> options() {
+        return SmokeHouseOptions
                 .of(SpillSerializer.forLongs(), SpillSerializer.forStrings())
                 .segmentBytes(128 << 10)                   // small segments: a lively map
                 .indexTier(tier)
                 .pilotCadence(Duration.ofSeconds(2))
-                .compactWhenGarbageAbove(0.0));            // manual: the button owns the money shot
+                .compactWhenGarbageAbove(0.0);             // manual: the button owns the money shot
+    }
+
+    private void start() throws IOException {
+        Path dir = Files.createTempDirectory("smokehouse-dashboard");
+        store = SmokeHouse.open(dir, options());
+        replicationServer = ReplicationServer.serve(store, options());   // the replica's feed
         stockRegimes();
 
         HttpServer http = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
@@ -116,6 +130,7 @@ public final class StoreDashboard {
         http.createContext("/compact", this::serveCompact);
         http.createContext("/toggle", this::serveToggle);
         http.createContext("/regime", this::serveRegime);
+        http.createContext("/replica", this::serveReplica);
         http.start();
 
         var ticker = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -201,6 +216,13 @@ public final class StoreDashboard {
                 int d = store.searchDepth(median);
                 depth = (d >= 0) ? d : ~d;
             }
+            // The replica's vitals, if one is on exhibit — lag under live churn is the show.
+            Replica<Long, String> r = replica;
+            String replicaJson = (r == null) ? "null"
+                    : "{\"lag\":" + r.lagSequence()
+                      + ",\"applied\":" + r.appliedSequence()
+                      + ",\"gapped\":" + r.gapped()
+                      + ",\"keys\":" + r.store().size() + "}";
             publish("{\"t\":\"stats\",\"keys\":" + store.size()
                     + ",\"garbage\":" + store.garbageBytes()
                     + ",\"puts\":" + puts.get() + ",\"gets\":" + gets.get()
@@ -210,6 +232,7 @@ public final class StoreDashboard {
                     + ",\"depth\":" + depth
                     + ",\"regime\":\"" + esc(regimeName) + "\""
                     + ",\"line\":\"" + esc(store.stats()) + "\""
+                    + ",\"replica\":" + replicaJson
                     + ",\"segments\":" + segs + "}");
         } catch (IOException | RuntimeException ignored) {
             // an observation tick must never kill the ticker
@@ -250,6 +273,70 @@ public final class StoreDashboard {
         requestedRegime.set(name);
         workloadOn.set(true);
         respond(ex, 204, null);
+    }
+
+    /**
+     * GET /replica?do=spawn|kill|reboot — Phase 8 on exhibit: spawn an in-process replica
+     * (bootstraps from a shipped backup, then follows the tail live), kill it mid-stream,
+     * or re-bootstrap it cold. Replica ops run on HTTP threads, serialized by their own
+     * lock; the primary's single-writer contract is untouched.
+     */
+    private void serveReplica(HttpExchange ex) throws IOException {
+        String q = ex.getRequestURI().getQuery();
+        String action = q == null ? ""
+                : URLDecoder.decode(q, StandardCharsets.UTF_8).replace("do=", "");
+        try {
+            synchronized (replicaLock) {
+                switch (action) {
+                    case "spawn" -> {
+                        if (replica == null) {
+                            replicaDir = Files.createTempDirectory("smokehouse-replica");
+                            replica = Replica.connect(replicaDir, options(),
+                                    replicationServer.port());
+                            publish("{\"t\":\"replica\",\"msg\":"
+                                    + "\"spawned — bootstrapping from a shipped backup\"}");
+                        }
+                    }
+                    case "kill" -> {
+                        if (replica != null) {
+                            replica.close();
+                            replica = null;
+                            publish("{\"t\":\"replica\",\"msg\":"
+                                    + "\"killed — its directory remains a valid store\"}");
+                        }
+                    }
+                    case "reboot" -> {
+                        if (replica != null) {
+                            replica.close();
+                            wipe(replicaDir);
+                            replica = Replica.connect(replicaDir, options(),
+                                    replicationServer.port());
+                            publish("{\"t\":\"replica\",\"msg\":"
+                                    + "\"re-bootstrapped — a cold start is always acceptable\"}");
+                        }
+                    }
+                    default -> {
+                        // unknown action: fall through to ok — the exhibit shrugs
+                    }
+                }
+            }
+            respond(ex, 200, "ok");
+        } catch (IOException e) {
+            respond(ex, 500, "replica op failed: " + e.getMessage());
+        }
+    }
+
+    private static void wipe(Path dir) throws IOException {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (var walk = Files.walk(dir)) {
+            for (Path p : walk.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                if (!p.equals(dir)) {
+                    Files.deleteIfExists(p);
+                }
+            }
+        }
     }
 
     private static void respond(HttpExchange ex, int code, String body) throws IOException {

@@ -57,6 +57,8 @@
   <div class="chip"><b id="depth">–</b><span>probe depth</span></div>
   <div class="chip"><b id="tier">–</b><span>index tier</span></div>
   <div class="chip"><b id="regime">–</b><span>regime</span></div>
+  <div class="chip" id="replChip" style="display:none"><b id="rlag">–</b><span>replica lag</span></div>
+  <div class="chip" id="replKeysChip" style="display:none"><b id="rkeys">–</b><span>replica keys</span></div>
 </div>
 
 <section>
@@ -70,6 +72,15 @@
     <button class="primary" onclick="fetch('/compact',{method:'POST'})">Compact now</button>
     <button id="toggle" onclick="toggle()">Pause workload</button>
     <span id="menu"></span>
+  </div>
+</section>
+
+<section>
+  <h2>Replica — Phase 8 on exhibit: bootstrap from a shipped backup, follow the tail, watch lag under churn</h2>
+  <div class="controls">
+    <button id="rspawn" onclick="fetch('/replica?do=spawn')">Spawn replica</button>
+    <button id="rkill" onclick="fetch('/replica?do=kill')" style="display:none">Kill replica</button>
+    <button id="rreboot" onclick="fetch('/replica?do=reboot')" style="display:none">Re-bootstrap</button>
   </div>
 </section>
 
@@ -136,6 +147,18 @@ es.onmessage = ev => {
     $('tier').textContent = m.tier;
     $('regime').textContent = m.regime;
     $('line').textContent = m.line;
+    const on = m.replica != null;
+    $('replChip').style.display = on ? '' : 'none';
+    $('replKeysChip').style.display = on ? '' : 'none';
+    $('rspawn').style.display = on ? 'none' : '';
+    $('rkill').style.display = on ? '' : 'none';
+    $('rreboot').style.display = on ? '' : 'none';
+    if (on) {
+      $('rlag').textContent = m.replica.gapped ? 'GAPPED' : fmtN(m.replica.lag);
+      $('rlag').style.color = m.replica.gapped ? 'var(--garbage)'
+          : (m.replica.lag > 0 ? 'var(--active)' : 'var(--live)');
+      $('rkeys').textContent = fmtN(m.replica.keys);
+    }
     drawSegments(m.segments);
     const v = m.line.match(/pilot="([^"]*)"/);
     if (v) {
@@ -149,6 +172,8 @@ es.onmessage = ev => {
     drawSegments(m.segments);
   } else if (m.t === 'regime') {
     log('regime → ' + m.name);
+  } else if (m.t === 'replica') {
+    log('replica: ' + m.msg, true);
   } else if (m.t === 'compacted') {
     log('COMPACTED: reclaimed ' + fmtB(m.reclaimed), true);
   } else if (m.t === 'error') {

@@ -8,8 +8,11 @@
   (`TreeMap` reference in `SmokeHouseTest`) is the required style for any new store behavior.
 - `./gradlew run` starts the shop window (Phase 4.4): `demo/StoreDashboard` + `dashboard.html`,
   SSE on `127.0.0.1:8079` (loopback only). Single driver thread owns all mutation; HTTP threads
-  only read or call `compact()` (copy phase off-lock by contract). Auto-compaction is disabled
-  there (`compactWhenGarbageAbove(0.0)`) so the Compact button owns the demo.
+  only read, call `compact()` (copy phase off-lock by contract), or drive the replica panel
+  (`/replica?do=spawn|kill|reboot` — Phase 8 on exhibit: spawn an in-process replica, watch lag
+  under churn, kill it, re-bootstrap cold; replica ops serialize on their own lock and never
+  touch the primary's writer). Auto-compaction is disabled there
+  (`compactWhenGarbageAbove(0.0)`) so the Compact button owns the demo.
 
 ## Git is host-side
 Same as the siblings: agent sandboxes cannot write `.git`. Run all git commands from a host
