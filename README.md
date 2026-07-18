@@ -271,6 +271,7 @@ conducts its replica fleet, [DryAge](https://github.com/RicheyWorks/DryAge) time
 backups, [Twine](https://github.com/RicheyWorks/Twine) ties crash-atomic batches over its
 puts, [SmokeSignal](https://github.com/RicheyWorks/SmokeSignal) puts it on a loopback wire,
 and [Jerky](https://github.com/RicheyWorks/Jerky) dries its backups for cold storage.
+Engine 12: [WholeHog](https://github.com/RicheyWorks/WholeHog) — the integration organism: all of them, composed and asserted together.
 
 ## License
 
