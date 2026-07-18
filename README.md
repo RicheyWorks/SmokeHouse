@@ -1,9 +1,17 @@
 # SmokeHouse — where the beef is preserved
 
+[![CI](https://github.com/RicheyWorks/SmokeHouse/actions/workflows/ci.yml/badge.svg)](https://github.com/RicheyWorks/SmokeHouse/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Java 17](https://img.shields.io/badge/Java-17-orange.svg)](https://adoptium.net/)
+
 An embedded, log-structured **record store** for the JVM whose primary index is a live, adaptive
 [CSRBT](https://github.com/RicheyWorks/CSRBT) tree and whose recovery engine is
 [SuperBeefSort](https://github.com/RicheyWorks/SuperBeefSort). Third engine of the ecosystem:
-CSRBT orders the world, SuperBeefSort feeds it, SmokeHouse is where the world actually lives.
+CSRBT orders the world, SuperBeefSort feeds it, SmokeHouse is where the world actually lives —
+and three younger engines read it: [Carver](https://github.com/RicheyWorks/Carver) plans queries
+over its indexes, [Renderer](https://github.com/RicheyWorks/Renderer) folds its tail into live
+aggregates, and [Brine](https://github.com/RicheyWorks/Brine) caches its hot set under an
+evolved eviction policy.
 
 One sentence is the entire consistency design:
 
@@ -65,8 +73,12 @@ store.overlapping("window", 900, 960);    // ...or overlapping 900..960
 **An interval index** (same builder) answers *stabbing* and *overlap* queries over records
 carrying an `(int start, int end)` span — CSRBT's CLRS-14.3 interval tree with subtree max-end
 augmentation doing the pruning, and an exact sidecar resolving candidates, so duplicate starts
-and even duplicate whole spans just work. Endpoints are `int` in v1 (epoch minutes/seconds —
-that's the augmentor's honest bound, not ours).
+and even duplicate whole spans just work. And since Phase 7's "generic interval endpoints"
+landed, a typed overload lifts spans past `int`: declare
+`.interval("when", Comparator.<Long>naturalOrder(), Order::startMillis, Order::endMillis)` and
+query with the typed `stab`/`overlapping` overloads — epoch-millis `Long`s, `Instant`s,
+anything with a total order, identical semantics, backed by CSRBT's
+`GenericIntervalAugmentor`.
 
 **Order statistics for free.** The index maintains subtree sizes intrinsically, so
 `countRange(lo, hi)`, `nthKey(rank)`, `rankOf(key)`, `medianKey()`, `percentileKey(pct)`,
@@ -206,6 +218,26 @@ keeps running (compaction's copy phase is off the store lock by design) — *hot
 the garbage machine if you want the squash to be dramatic. Regime buttons switch the workload
 live; *Pause* freezes it mid-scene. Binds loopback only — an exhibit, not a service.
 
+## Replication
+
+Phase 8's ring: single-writer primary, N read replicas, over a loopback JDK socket — zero
+dependencies, bootstrap by shipped backup, catch-up by the tail.
+
+```java
+var server  = ReplicationServer.serve(primary, opts);         // ephemeral loopback port
+var replica = Replica.connect(replicaDir, opts, server.port());
+replica.awaitCaughtUp(primary.tailSequence(), 5_000);
+replica.store().range(...);                                   // a full SmokeHouse: every read
+replica.store().medianKey();                                  // surface and index tier works
+replica.lagSequence();                                        // 0 = caught up
+```
+
+A replica **is** a SmokeHouse whose writer happens to live elsewhere — frames apply through its
+own `put`/`delete` exactly as recovery would, so its directory reopens as a plain store (that's
+manual promotion). A replica that falls too far behind is told it gapped and stops applying —
+consistently stale, never wrong; reconnect to re-bootstrap. Non-goals, loudly: no automatic
+failover, no write forwarding, no consensus.
+
 ## Design
 
 The full architecture — why Bitcask-style beat LSM here, the `IndexEntry` trick that turns a
@@ -215,12 +247,24 @@ set into a map through public API only, the compaction crash windows, and every 
 Its four phases (core store, durability + compaction, ingestion, the index ring + dashboard) are
 all complete.
 
-The successor ADR carries what comes next. Measurement, durability hardening, and the read/watch
-surface have **landed** — the JMH suite (Benchmarks above, §D1 seam decided by number), an
-append/torn-tail crash-fuzz harness, an advisory segment manifest, backup/restore, and the log tail
-feeding watchers and point-in-time snapshots; still ahead are generic (typed) interval endpoints,
-tail-shipped read replicas, and Maven Central release:
+The successor ADR carried what came next, and nearly all of it has **landed**: the JMH suite
+(Benchmarks above, §D1 seam decided by number), the append/torn-tail crash-fuzz harness, the
+advisory segment manifest, backup/restore, the log tail feeding watchers and point-in-time
+snapshots, generic (typed) interval endpoints, tail-shipped read replicas (Replication above),
+and local `publishToMavenLocal` installability for the whole ring. What remains of Phase 9 is
+the Maven Central release itself:
 [`SuperBeefSort/docs/adr-ecosystem-outer-ring.md`](https://github.com/RicheyWorks/SuperBeefSort/blob/main/docs/adr-ecosystem-outer-ring.md).
+
+## The ecosystem
+
+| Engine | Role |
+|---|---|
+| [CSRBT](https://github.com/RicheyWorks/CSRBT) | the adaptive ordered index — orders the world |
+| [SuperBeefSort](https://github.com/RicheyWorks/SuperBeefSort) | the intake tract — profiles, sorts, feeds; SmokeHouse's recovery engine |
+| **SmokeHouse** (this repo) | the log-structured store — where the world lives |
+| [Carver](https://github.com/RicheyWorks/Carver) | the read planner over `IndexedStore` — decides how to read |
+| [Renderer](https://github.com/RicheyWorks/Renderer) | the materialized-view engine — folds the tail into live aggregates |
+| [Brine](https://github.com/RicheyWorks/Brine) | the adaptive cache — invalidation rides this store's tail |
 
 ## License
 
