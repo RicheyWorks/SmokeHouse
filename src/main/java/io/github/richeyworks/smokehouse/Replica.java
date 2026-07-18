@@ -38,16 +38,18 @@ public final class Replica<K, V> implements Closeable {
     private final SmokeHouseOptions<K, V> opts;
     private final Thread apply;
 
-    private volatile long appliedSequence = -1;
+    private volatile long appliedSequence;
     private volatile long primarySequence;
     private volatile boolean gapped;
 
     private Replica(SmokeHouse<K, V> store, Socket socket, DataInputStream in,
-                    SmokeHouseOptions<K, V> opts) {
+                    SmokeHouseOptions<K, V> opts, long baseSequence) {
         this.store = store;
         this.socket = socket;
         this.in = in;
         this.opts = opts;
+        this.appliedSequence = baseSequence;                   // the shipped backup covers ≤ this
+        this.primarySequence = baseSequence + 1;
         this.apply = new Thread(this::applyLoop, "smokehouse-replica-apply");
         this.apply.setDaemon(true);
     }
@@ -86,8 +88,9 @@ public final class Replica<K, V> implements Closeable {
                     }
                 }
             }
+            long baseSequence = in.readLong();                 // caught up to here via the files
             SmokeHouse<K, V> store = SmokeHouse.restore(dir, opts);
-            Replica<K, V> replica = new Replica<>(store, socket, in, opts);
+            Replica<K, V> replica = new Replica<>(store, socket, in, opts, baseSequence);
             replica.apply.start();
             return replica;
         } catch (IOException e) {
@@ -136,7 +139,7 @@ public final class Replica<K, V> implements Closeable {
         return Math.max(0, (primarySequence - 1) - appliedSequence);
     }
 
-    /** The last primary tail sequence applied here ({@code -1} before the first frame). */
+    /** The last primary tail sequence covered here (bootstrap baseline before any frame). */
     public long appliedSequence() {
         return appliedSequence;
     }

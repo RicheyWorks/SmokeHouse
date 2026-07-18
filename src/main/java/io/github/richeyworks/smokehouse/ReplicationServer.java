@@ -93,7 +93,8 @@ public final class ReplicationServer<K, V> implements Closeable {
             DataOutputStream out = new DataOutputStream(
                     new BufferedOutputStream(socket.getOutputStream(), 1 << 16));
             FrameWriter writer = new FrameWriter(out);
-            AutoCloseable sub = store.tail(store.tailSequence(), writer);
+            long seq0 = store.tailSequence();                  // frames stream from here on
+            AutoCloseable sub = store.tail(seq0, writer);
             synchronized (perClient) {
                 perClient.add(sub);
                 perClient.add(socket);
@@ -119,6 +120,10 @@ public final class ReplicationServer<K, V> implements Closeable {
                 }
                 Files.deleteIfExists(tmp);
             }
+            // The bootstrap baseline: everything at or before this sequence arrived inside
+            // the shipped segments, so the replica is ALREADY caught up to here even if no
+            // frame ever arrives (all-history-before-connect is the common case).
+            out.writeLong(seq0 - 1);
             writer.flushAndGoLive();
         } catch (IOException e) {
             closeQuietly(socket);                              // replica gone mid-bootstrap
