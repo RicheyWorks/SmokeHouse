@@ -272,6 +272,7 @@ backups, [Twine](https://github.com/RicheyWorks/Twine) ties crash-atomic batches
 puts, [SmokeSignal](https://github.com/RicheyWorks/SmokeSignal) puts it on a loopback wire,
 and [Jerky](https://github.com/RicheyWorks/Jerky) dries its backups for cold storage.
 Engine 12: [WholeHog](https://github.com/RicheyWorks/WholeHog) — the integration organism: all of them, composed and asserted together.
+Engines 13–14 (2026-08-19): [Rub](https://github.com/RicheyWorks/Rub) (observability — the tail watcher promoted to an organ) · [Sizzle](https://github.com/RicheyWorks/Sizzle) (chaos — deterministic fault injection at the write seam).
 
 ## License
 
