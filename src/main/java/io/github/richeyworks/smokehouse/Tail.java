@@ -88,7 +88,7 @@ final class Tail<K, V> {
     /** One subscriber: a bounded queue drained by a daemon thread, drop-oldest when the consumer lags. */
     private final class Sub implements AutoCloseable {
         private final TailListener<K, V> listener;
-        private final LinkedBlockingQueue<TailEvent<K, V>> queue = new LinkedBlockingQueue<>(1 << 12);
+        private final LinkedBlockingQueue<TailEvent<K, V>> queue = new LinkedBlockingQueue<>(ringCapacity);
         private volatile boolean gapped;
         private volatile boolean running = true;
         private Thread pump;

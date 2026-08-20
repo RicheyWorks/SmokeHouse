@@ -61,11 +61,13 @@ public final class SmokeHouseOptions<K, V> {
     private final int retainNewest;
     private final AccessPolicy accessPolicy;
     private final double compactAboveRatio;
+    private final int tailRingCapacity;
 
     private SmokeHouseOptions(SpillSerializer<K> keySerializer, SpillSerializer<V> valueSerializer,
                               Comparator<? super K> comparator, Fsync fsync, long fsyncIntervalMillis,
                               long segmentBytes, IndexTier indexTier, Duration pilotCadence,
-                              int retainNewest, AccessPolicy accessPolicy, double compactAboveRatio) {
+                              int retainNewest, AccessPolicy accessPolicy, double compactAboveRatio,
+                              int tailRingCapacity) {
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
         this.comparator = comparator;
@@ -77,6 +79,7 @@ public final class SmokeHouseOptions<K, V> {
         this.retainNewest = retainNewest;
         this.accessPolicy = accessPolicy;
         this.compactAboveRatio = compactAboveRatio;
+        this.tailRingCapacity = tailRingCapacity;
     }
 
     /** Options for naturally-ordered keys. Serializers are the only thing you must supply. */
@@ -94,13 +97,13 @@ public final class SmokeHouseOptions<K, V> {
                 Objects.requireNonNull(valueSerializer, "valueSerializer"),
                 Objects.requireNonNull(comparator, "comparator"),
                 Fsync.INTERVAL, 50L, 64L << 20, IndexTier.ADAPTIVE, Duration.ofSeconds(5), 0,
-                AccessPolicy.BALANCED, 0.5);
+                AccessPolicy.BALANCED, 0.5, 1 << 12);
     }
 
     public SmokeHouseOptions<K, V> fsync(Fsync policy) {
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 Objects.requireNonNull(policy), fsyncIntervalMillis, segmentBytes, indexTier,
-                pilotCadence, retainNewest, accessPolicy, compactAboveRatio);
+                pilotCadence, retainNewest, accessPolicy, compactAboveRatio, tailRingCapacity);
     }
 
     /** Group-fsync period for {@link Fsync#INTERVAL} (default 50 ms) — the bounded loss window. */
@@ -110,7 +113,7 @@ public final class SmokeHouseOptions<K, V> {
         }
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, millis, segmentBytes, indexTier, pilotCadence, retainNewest, accessPolicy,
-                compactAboveRatio);
+                compactAboveRatio, tailRingCapacity);
     }
 
     /** Segment roll threshold in bytes (default 64 MB). Small values are useful in tests. */
@@ -120,13 +123,13 @@ public final class SmokeHouseOptions<K, V> {
         }
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, fsyncIntervalMillis, bytes, indexTier, pilotCadence, retainNewest,
-                accessPolicy, compactAboveRatio);
+                accessPolicy, compactAboveRatio, tailRingCapacity);
     }
 
     public SmokeHouseOptions<K, V> indexTier(IndexTier tier) {
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, fsyncIntervalMillis, segmentBytes, Objects.requireNonNull(tier),
-                pilotCadence, retainNewest, accessPolicy, compactAboveRatio);
+                pilotCadence, retainNewest, accessPolicy, compactAboveRatio, tailRingCapacity);
     }
 
     /**
@@ -144,7 +147,7 @@ public final class SmokeHouseOptions<K, V> {
     public SmokeHouseOptions<K, V> accessPolicy(AccessPolicy policy) {
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, fsyncIntervalMillis, segmentBytes, indexTier, pilotCadence, retainNewest,
-                Objects.requireNonNull(policy, "policy"), compactAboveRatio);
+                Objects.requireNonNull(policy, "policy"), compactAboveRatio, tailRingCapacity);
     }
 
     /** How often the internal pilot runs one policy-gated evaluation (every tier except STATIC). */
@@ -154,7 +157,7 @@ public final class SmokeHouseOptions<K, V> {
         }
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, fsyncIntervalMillis, segmentBytes, indexTier, cadence, retainNewest,
-                accessPolicy, compactAboveRatio);
+                accessPolicy, compactAboveRatio, tailRingCapacity);
     }
 
     /**
@@ -170,7 +173,7 @@ public final class SmokeHouseOptions<K, V> {
         }
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, fsyncIntervalMillis, segmentBytes, indexTier, pilotCadence, n, accessPolicy,
-                compactAboveRatio);
+                compactAboveRatio, tailRingCapacity);
     }
 
     /**
@@ -187,7 +190,23 @@ public final class SmokeHouseOptions<K, V> {
         }
         return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
                 fsync, fsyncIntervalMillis, segmentBytes, indexTier, pilotCadence, retainNewest,
-                accessPolicy, ratio);
+                accessPolicy, ratio, tailRingCapacity);
+    }
+
+    /**
+     * Tail ring capacity (default 4096): how many committed mutations the tail retains for
+     * replay, AND how far behind a single subscriber may fall before the drop-oldest contract
+     * fires and it is told via {@code onGap()} (2026-08-20 — the seam that makes gap behavior
+     * honestly testable instead of unreachable behind a constant). Small values are for tests
+     * and for consumers that would rather re-bootstrap than buffer.
+     */
+    public SmokeHouseOptions<K, V> tailRing(int capacity) {
+        if (capacity < 8) {
+            throw new IllegalArgumentException("tailRing must be >= 8: " + capacity);
+        }
+        return new SmokeHouseOptions<>(keySerializer, valueSerializer, comparator,
+                fsync, fsyncIntervalMillis, segmentBytes, indexTier, pilotCadence, retainNewest,
+                accessPolicy, compactAboveRatio, capacity);
     }
 
     SpillSerializer<K> keySerializer() { return keySerializer; }
@@ -198,6 +217,7 @@ public final class SmokeHouseOptions<K, V> {
     long segmentBytesLimit() { return segmentBytes; }
     IndexTier tier() { return indexTier; }
     Duration cadence() { return pilotCadence; }
+    int tailRingCapacity() { return tailRingCapacity; }
     int retention() { return retainNewest; }
     AccessPolicy access() { return accessPolicy; }
     double compactAbove() { return compactAboveRatio; }

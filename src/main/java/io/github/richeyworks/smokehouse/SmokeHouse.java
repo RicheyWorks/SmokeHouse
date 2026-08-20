@@ -109,9 +109,6 @@ public final class SmokeHouse<K, V> implements Closeable {
     /** Laboratory members the EVOLUTION tier hosts (the bandit trials on the first). */
     private static final int EVOLUTION_SLOTS = 1;
 
-    /** Recent committed mutations the tail keeps for late subscribers to replay. */
-    private static final int TAIL_RING_CAPACITY = 1 << 12;
-
     private final Object lock = new Object();
     private final SmokeHouseOptions<K, V> opts;
     private final SegmentLog log;
@@ -123,7 +120,7 @@ public final class SmokeHouse<K, V> implements Closeable {
     private final EvolutionAdaptation<IndexEntry<K>> evolution;    // EVOLUTION tier only
     private final ScheduledExecutorService pilot;                  // null in STATIC tier
     private final Map<Integer, Long> garbage = new HashMap<>();    // segmentId -> dead bytes; store-lock guarded
-    private final Tail<K, V> tailStream = new Tail<>(TAIL_RING_CAPACITY);   // Phase 7: committed-mutation stream
+    private final Tail<K, V> tailStream;   // Phase 7: committed-mutation stream (ring sized by opts)
     private volatile String pilotVerdict = "not yet evaluated";
     private volatile boolean compacting;                           // single-compaction guard: serializes compact()
     private int openSnapshots;                                     // snapshots pinning the segment set (store-lock guarded)
@@ -139,6 +136,7 @@ public final class SmokeHouse<K, V> implements Closeable {
                        EvolutionAdaptation<IndexEntry<K>> evolution,
                        Map<Integer, Long> recoveredGarbage) {
         this.opts = opts;
+        this.tailStream = new Tail<>(opts.tailRingCapacity());
         this.log = log;
         this.index = index;
         this.navigable = (index != null) ? new NavigableOrderedSet<>(index) : null;
