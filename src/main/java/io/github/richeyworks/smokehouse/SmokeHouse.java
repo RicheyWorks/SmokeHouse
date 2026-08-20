@@ -959,9 +959,55 @@ public final class SmokeHouse<K, V> implements Closeable {
      */
     public static <K, V> int scanSorted(byte[] run, SmokeHouseOptions<K, V> opts,
                                         BiConsumer<K, V> consumer) throws IOException {
+        Objects.requireNonNull(consumer, "consumer");
+        DataInputStream in = openRun(run, opts);
+        int count = in.readInt();
+        for (int i = 0; i < count; i++) {
+            K key = opts.keySerializer().read(in);
+            V value = opts.valueSerializer().read(in);
+            consumer.accept(key, value);
+        }
+        return count;
+    }
+
+    /**
+     * The run is a seed (2026-08-20): build a FRESH store at {@code dir} from a sorted run —
+     * pure composition of the run's decoder with the {@link #importInto} bulk seam. The seed
+     * holds the run's <em>state</em> only: no log history, no tombstones, no generations —
+     * a store born today from a moment recorded then. Composed with {@code Jerky.extract},
+     * this revives queryable state straight from a cold archive's sidecar without inflating
+     * the segments at all.
+     *
+     * @return the seeded store, open and fully queryable (order statistics included)
+     */
+    public static <K, V> SmokeHouse<K, V> importSorted(Path dir, SmokeHouseOptions<K, V> opts,
+                                                       byte[] run) throws IOException {
+        DataInputStream in = openRun(run, opts);
+        int count = in.readInt();
+        int[] remaining = {count};
+        return importInto(dir, opts, new RecordSource<K, V>() {
+            @Override
+            public RecordSource.Record<K, V> next() throws IOException {
+                if (remaining[0] == 0) {
+                    return null;
+                }
+                remaining[0]--;
+                return new RecordSource.Record<>(opts.keySerializer().read(in),
+                        opts.valueSerializer().read(in));
+            }
+
+            @Override
+            public void close() {
+                // in-memory bytes; nothing to release
+            }
+        });
+    }
+
+    /** CRC-verify a run's whole body and hand back a stream positioned at the count. */
+    private static DataInputStream openRun(byte[] run, SmokeHouseOptions<?, ?> opts)
+            throws IOException {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(opts, "opts");
-        Objects.requireNonNull(consumer, "consumer");
         if (run.length < Long.BYTES + Integer.BYTES * 2) {
             throw new IOException("scan run truncated: " + run.length + " bytes");
         }
@@ -977,13 +1023,7 @@ public final class SmokeHouse<K, V> implements Closeable {
         if (in.readInt() != SCAN_RUN_MAGIC) {
             throw new IOException("not a scan run (bad magic)");
         }
-        int count = in.readInt();
-        for (int i = 0; i < count; i++) {
-            K key = opts.keySerializer().read(in);
-            V value = opts.valueSerializer().read(in);
-            consumer.accept(key, value);
-        }
-        return count;
+        return in;
     }
 
     /**

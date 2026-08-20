@@ -63,6 +63,45 @@ class SortedRunTest {
     }
 
     @Test
+    void theRunSeedsAFreshFullyQueryableStore(@TempDir Path dir) throws IOException {
+        Random rnd = new Random(11);
+        TreeMap<Long, String> oracle = new TreeMap<>();
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(dir.resolve("s"), opts())) {
+            for (int i = 0; i < 400; i++) {
+                long key = rnd.nextInt(120);
+                if (rnd.nextInt(6) == 0) {
+                    store.delete(key);
+                    oracle.remove(key);
+                } else {
+                    String v = "v" + key + ":" + i;
+                    store.put(key, v);
+                    oracle.put(key, v);
+                }
+            }
+            Path run = dir.resolve("scan.run");
+            store.exportSorted(run);
+        }
+
+        // Seed a FRESH store from the run alone — no segments, no history, pure state.
+        byte[] runBytes = Files.readAllBytes(dir.resolve("scan.run"));
+        try (SmokeHouse<Long, String> seeded =
+                     SmokeHouse.importSorted(dir.resolve("seeded"), opts(), runBytes)) {
+            assertEquals(oracle.size(), seeded.size(), "the seed is the run's state");
+            TreeMap<Long, String> scanned = new TreeMap<>();
+            seeded.range(seeded.firstKey(), seeded.lastKey(), scanned::put);
+            assertEquals(oracle, scanned, "every record, exactly");
+            assertEquals(oracle.firstKey(), seeded.firstKey());
+            assertEquals(oracle.lastKey(), seeded.lastKey());
+            assertEquals(oracle.size(), seeded.countRange(seeded.firstKey(), seeded.lastKey()),
+                    "order statistics work on the seed");
+        }
+
+        // Seeding into a populated directory is refused — the importInto guard holds.
+        assertThrows(IllegalStateException.class,
+                () -> SmokeHouse.importSorted(dir.resolve("s"), opts(), runBytes));
+    }
+
+    @Test
     void emptyStoresExportEmptyRuns(@TempDir Path dir) throws IOException {
         try (SmokeHouse<Long, String> store = SmokeHouse.open(dir.resolve("s"), opts())) {
             Path run = dir.resolve("empty.run");
