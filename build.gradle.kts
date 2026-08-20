@@ -12,7 +12,7 @@ application {
 }
 
 group = "io.github.richeyworks"
-version = "0.1.0"
+version = "0.2.0"
 
 java {
     withSourcesJar()
@@ -25,7 +25,7 @@ tasks.withType<JavaCompile>().configureEach {
 
 dependencies {
     // Both resolved to live sibling sources via the composite build in settings.gradle.kts.
-    api("io.github.richeyworks:csrbt-core:0.1.0")          // the index engine
+    api("io.github.richeyworks:csrbt-core:0.3.0")          // the index engine
     api("io.github.richeyworks:superbeefsort:0.1.0")       // SpillSerializer + recovery sort
 
     testImplementation(platform(libs.junit.bom))

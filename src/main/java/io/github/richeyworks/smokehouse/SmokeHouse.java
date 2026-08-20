@@ -895,6 +895,97 @@ public final class SmokeHouse<K, V> implements Closeable {
         }
     }
 
+    /** {@code scan.run} magic: "SRUN". */
+    private static final int SCAN_RUN_MAGIC = 0x53_52_55_4E;
+
+    /**
+     * Export every live record, in key order, as a flat <b>sorted run</b> (ADR scan-sidecar,
+     * 2026-08-20): {@code [magic][count]} then count × (key, value) through this store's own
+     * serializers — the same self-delimiting framing the wire and replication ride — with a
+     * CRC32 trailer in the house shape. One {@link #scanSorted} pass over the file answers the
+     * full-scan question that previously required restoring the store and walking its index
+     * (measured at 524× the raw-read floor; see WholeHog's 2026-08-20 experiment).
+     *
+     * <p>Costs one ordered walk with per-record reads NOW, while the data is hot — the right
+     * time to pay it. The run is a snapshot: records written after this call are not in it.</p>
+     *
+     * @return the number of records exported
+     */
+    public int exportSorted(Path file) throws IOException {
+        Objects.requireNonNull(file, "file");
+        synchronized (lock) {
+            int count = size();
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            try (var fileOut = Files.newOutputStream(file)) {
+                var checked = new java.util.zip.CheckedOutputStream(
+                        new java.io.BufferedOutputStream(fileOut), crc);
+                DataOutputStream out = new DataOutputStream(checked);
+                out.writeInt(SCAN_RUN_MAGIC);
+                out.writeInt(count);
+                if (count > 0) {
+                    try {
+                        range(firstKey(), lastKey(), (k, v) -> {
+                            try {
+                                opts.keySerializer().write(k, out);
+                                opts.valueSerializer().write(v, out);
+                            } catch (IOException e) {
+                                throw new java.io.UncheckedIOException(e);
+                            }
+                        });
+                    } catch (java.io.UncheckedIOException e) {
+                        throw e.getCause();
+                    }
+                }
+                out.flush();
+                new DataOutputStream(fileOut).writeLong(crc.getValue());   // trailer, unsummed
+            }
+            return count;
+        }
+    }
+
+    /** {@link #scanSorted(byte[], SmokeHouseOptions, BiConsumer)} over a file's bytes. */
+    public static <K, V> int scanSorted(Path file, SmokeHouseOptions<K, V> opts,
+                                        BiConsumer<K, V> consumer) throws IOException {
+        return scanSorted(Files.readAllBytes(file), opts, consumer);
+    }
+
+    /**
+     * Stream a sorted run (the bytes {@link #exportSorted} wrote — perhaps just extracted from
+     * a cold archive) to {@code consumer} in key order: CRC-verified first, then decoded with
+     * the same serializers that wrote it. No store, no recovery, no index — this is the cold
+     * scan the sidecar exists for.
+     *
+     * @return the number of records delivered
+     */
+    public static <K, V> int scanSorted(byte[] run, SmokeHouseOptions<K, V> opts,
+                                        BiConsumer<K, V> consumer) throws IOException {
+        Objects.requireNonNull(run, "run");
+        Objects.requireNonNull(opts, "opts");
+        Objects.requireNonNull(consumer, "consumer");
+        if (run.length < Long.BYTES + Integer.BYTES * 2) {
+            throw new IOException("scan run truncated: " + run.length + " bytes");
+        }
+        int body = run.length - Long.BYTES;
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(run, 0, body);
+        DataInputStream trailer = new DataInputStream(
+                new ByteArrayInputStream(run, body, Long.BYTES));
+        if (crc.getValue() != trailer.readLong()) {
+            throw new IOException("scan run CRC mismatch — refusing to deliver corrupt records");
+        }
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(run, 0, body));
+        if (in.readInt() != SCAN_RUN_MAGIC) {
+            throw new IOException("not a scan run (bad magic)");
+        }
+        int count = in.readInt();
+        for (int i = 0; i < count; i++) {
+            K key = opts.keySerializer().read(in);
+            V value = opts.valueSerializer().read(in);
+            consumer.accept(key, value);
+        }
+        return count;
+    }
+
     /**
      * Restore a {@link #backup(Path)} — literally {@link #open(Path, SmokeHouseOptions) open} on the
      * backup directory, named for the round-trip's sake. Recovery does all the work.
