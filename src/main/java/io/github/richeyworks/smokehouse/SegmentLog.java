@@ -6,6 +6,7 @@ import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -216,33 +217,51 @@ final class SegmentLog implements Closeable {
 
     /** Positional read of the record at {@code loc} — thread-safe, works on active and closed segments. */
     RecordCodec.Rec read(Location loc) throws IOException {
-        FileChannel ch = readers.computeIfAbsent(loc.segmentId(), id -> {
+        for (int attempt = 0; ; attempt++) {
+            FileChannel ch = readers.computeIfAbsent(loc.segmentId(), this::openReader);
             try {
-                return FileChannel.open(segmentPath(id), StandardOpenOption.READ);
-            } catch (IOException e) {
-                throw new java.io.UncheckedIOException(e);
-            }
-        });
-        long remaining = ch.size() - loc.offset();
-        if (remaining < RecordCodec.HEADER_BYTES) {
-            return RecordCodec.Rec.torn();
-        }
-        InputStream in = new InputStream() {
-            private long pos = loc.offset();
-            @Override public int read() throws IOException {
-                byte[] one = new byte[1];
-                int n = read(one, 0, 1);
-                return n < 0 ? -1 : one[0] & 0xFF;
-            }
-            @Override public int read(byte[] b, int off, int len) throws IOException {
-                int n = ch.read(ByteBuffer.wrap(b, off, len), pos);
-                if (n > 0) {
-                    pos += n;
+                long remaining = ch.size() - loc.offset();
+                if (remaining < RecordCodec.HEADER_BYTES) {
+                    return RecordCodec.Rec.torn();
                 }
-                return n;
+                InputStream in = new InputStream() {
+                    private long pos = loc.offset();
+                    @Override public int read() throws IOException {
+                        byte[] one = new byte[1];
+                        int n = read(one, 0, 1);
+                        return n < 0 ? -1 : one[0] & 0xFF;
+                    }
+                    @Override public int read(byte[] b, int off, int len) throws IOException {
+                        int n = ch.read(ByteBuffer.wrap(b, off, len), pos);
+                        if (n > 0) {
+                            pos += n;
+                        }
+                        return n;
+                    }
+                };
+                return RecordCodec.decode(new DataInputStream(new BufferedInputStream(in, 8192)));
+            } catch (ClosedChannelException staleReader) {
+                // A concurrent compaction commit closes victim readers (Windows cannot delete an
+                // open file), and it may close THIS cached channel mid-read. The channel is gone,
+                // but the bytes at a committed offset never change: drop the stale cache entry and
+                // reopen. If the segment itself was deleted (a victim, not the reused merged id),
+                // the reopen throws NoSuchFileException and the caller re-resolves the key's new
+                // location. Bounded, so a genuinely unusable channel still surfaces loudly.
+                readers.remove(loc.segmentId(), ch);
+                if (attempt >= 4) {
+                    throw staleReader;
+                }
             }
-        };
-        return RecordCodec.decode(new DataInputStream(new BufferedInputStream(in, 8192)));
+        }
+    }
+
+    /** Open a read-only channel for a segment; a cache-miss loader for {@link #readers}. */
+    private FileChannel openReader(int id) {
+        try {
+            return FileChannel.open(segmentPath(id), StandardOpenOption.READ);
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
     }
 
     /** Sequential visitor for recovery: every intact record, oldest segment first. */

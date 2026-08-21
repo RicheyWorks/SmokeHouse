@@ -529,7 +529,11 @@ public final class SmokeHouse<K, V> implements Closeable {
                 }
                 return readValue(rec.value());
             } catch (IOException | UncheckedIOException raced) {
-                if (attempt >= 1) {
+                // A read can overlap a compaction commit that repointed this entry or deleted the
+                // segment it named; re-resolve and retry. Bounded (relentless back-to-back
+                // compaction could otherwise chase a key forever) but generous, since a single
+                // overlap is the norm and a genuine divergence still surfaces.
+                if (attempt >= 7) {
                     throw new IOException("log/index divergence for key " + key
                             + " at " + entry.location(), raced);
                 }
@@ -603,12 +607,47 @@ public final class SmokeHouse<K, V> implements Closeable {
             observeRange(entries);
         }
         for (IndexEntry<K> e : entries) {
-            RecordCodec.Rec rec = log.read(e.location());
-            if (rec == null || rec.isTorn() || rec.tombstone()) {
-                throw new IOException("index pointed at an unreadable record at " + e.location());
+            RecordCodec.Rec rec = readSnapshotEntry(e.key(), e.location());
+            if (rec != null) {                                // null = deleted/evicted mid-range
+                consumer.accept(e.key(), readValue(rec.value()));
             }
-            consumer.accept(e.key(), readValue(rec.value()));
         }
+    }
+
+    /**
+     * Read the record for a range snapshot entry, tolerating a concurrent compaction. get()
+     * guards a single key's read this way; range() used to read its snapshot off-lock with no
+     * such guard, so a compaction that committed between the snapshot and a read — deleting the
+     * old segment and repointing the entry into the merged one — made range() throw on a healthy
+     * store. Here each read that races a commit re-resolves the key's current location under the
+     * lock and tries again; because compactions are serialized and each takes real work, a small
+     * bounded number of re-resolutions clears any realistic overlap while still surfacing a
+     * genuine log/index divergence. Returns {@code null} if the key went away (deleted or evicted)
+     * mid-range — it is simply no longer live, matching get()'s re-resolution to the current state.
+     */
+    private RecordCodec.Rec readSnapshotEntry(K key, SegmentLog.Location snapshotLoc)
+            throws IOException {
+        SegmentLog.Location loc = snapshotLoc;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            try {
+                RecordCodec.Rec rec = log.read(loc);
+                if (rec != null && !rec.isTorn() && !rec.tombstone()) {
+                    return rec;
+                }
+            } catch (IOException | UncheckedIOException raced) {
+                // fall through to re-resolve against the (possibly just-compacted) index
+            }
+            IndexEntry<K> current;
+            synchronized (lock) {
+                current = liveEntry(key);
+            }
+            if (current == null) {
+                return null;
+            }
+            loc = current.location();
+        }
+        throw new IOException("range: key " + key + " stayed unreadable after repeated "
+                + "re-resolution (sustained compaction, or a real log/index divergence) at " + loc);
     }
 
     /** Each ranged key was a read; tell the monitor so (bounded — the rolling window saturates anyway). */
