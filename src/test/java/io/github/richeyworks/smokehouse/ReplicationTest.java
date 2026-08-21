@@ -5,12 +5,18 @@ import io.github.richeyworks.superbeefsort.external.SpillSerializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.BufferedOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.file.Path;
 import java.util.Random;
 import java.util.TreeMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -144,5 +150,52 @@ class ReplicationTest {
         try (SmokeHouse<Long, String> reopened = SmokeHouse.open(replicaDir, opts())) {
             assertEquals(oracle, scan(reopened), "manual promotion is just open()");
         }
+    }
+
+    @Test
+    void aReplicaGapsOnANonContiguousFrameInsteadOfApplyingAHole(@TempDir Path dir) throws Exception {
+        // Twelfth pass: the replica applies only CONTIGUOUS frames. A fake primary ships an empty
+        // backup (baseSequence 0, so the first expected frame is sequence 1), one good frame
+        // (seq 1), then a frame that SKIPS seq 2 (seq 3) — as if the tail dropped an event but its
+        // FRAME_GAP arrived a frame late. Applying seq 3 would leave a state that never existed on
+        // the primary; the replica must gap and keep the clean prefix it has.
+        SmokeHouseOptions<Long, String> opts = SmokeHouseOptions.of(
+                SpillSerializer.forLongs(), SpillSerializer.forStrings());
+        try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            Thread primary = new Thread(() -> {
+                try (Socket s = server.accept();
+                     DataOutputStream out = new DataOutputStream(
+                             new BufferedOutputStream(s.getOutputStream()))) {
+                    out.writeInt(0);                              // empty backup: zero shipped files
+                    out.writeLong(0L);                            // baseSequence → expect frame seq 1
+                    writeFrame(out, 1L, 2L, 10L, "ten");          // contiguous: applied
+                    writeFrame(out, 3L, 4L, 30L, "thirty");       // SKIPS seq 2: must gap, not apply
+                    out.flush();
+                    Thread.sleep(3_000);                          // hold the socket open while it reads
+                } catch (Exception ignored) {
+                    // the replica closing the socket ends the thread
+                }
+            }, "fake-primary");
+            primary.setDaemon(true);
+            primary.start();
+
+            try (Replica<Long, String> replica = Replica.connect(dir, opts, server.getLocalPort())) {
+                for (int i = 0; i < 300 && !replica.gapped(); i++) {
+                    Thread.sleep(10);
+                }
+                assertTrue(replica.gapped(), "a non-contiguous frame must gap the replica");
+                assertEquals("ten", replica.store().get(10L), "the contiguous frame applied");
+                assertNull(replica.store().get(30L), "the frame past the hole must NOT apply");
+            }
+        }
+    }
+
+    private static void writeFrame(DataOutputStream out, long sequence, long primarySequence,
+                                   long key, String value) throws IOException {
+        out.writeByte(ReplicationServer.FRAME_PUT);
+        out.writeLong(sequence);
+        out.writeLong(primarySequence);
+        SpillSerializer.forLongs().write(key, out);
+        SpillSerializer.forStrings().write(value, out);
     }
 }

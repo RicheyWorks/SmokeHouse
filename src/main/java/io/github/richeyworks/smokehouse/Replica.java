@@ -113,6 +113,18 @@ public final class Replica<K, V> implements Closeable {
                 }
                 long sequence = in.readLong();
                 primarySequence = in.readLong();
+                // Twelfth pass: apply only CONTIGUOUS frames. The server sends FRAME_GAP when its
+                // tail ring drops events for us, but the replica must not trust that signal alone —
+                // the tail's gap flag is set on the producer side and read on the consumer side with
+                // no happens-before tying it to a specific event, so onGap can arrive one frame late.
+                // A frame whose sequence is not exactly the next one means events were missed, and
+                // applying it would leave a state that never existed on the primary — a suffix
+                // without its prefix, which is neither a consistent prefix nor "never wrong." A hole
+                // is a gap: stop, keep the clean prefix we have, and let the operator re-bootstrap.
+                if (sequence != appliedSequence + 1) {
+                    gapped = true;
+                    return;
+                }
                 K key = opts.keySerializer().read(in);
                 if (type == ReplicationServer.FRAME_PUT) {
                     V value = opts.valueSerializer().read(in);
