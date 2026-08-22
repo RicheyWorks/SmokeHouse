@@ -263,8 +263,53 @@ public final class SmokeHouse<K, V> implements Closeable {
 
     /** Open (or create) a store at {@code dir}, recovering the index from the log (hint-accelerated). */
     public static <K, V> SmokeHouse<K, V> open(Path dir, SmokeHouseOptions<K, V> opts) throws IOException {
+        return recover(dir, opts, -1L);
+    }
+
+    /**
+     * Open a store as of the first {@code maxRecords} mutations in the log's write order —
+     * record-granularity time travel (2026-08-22, the seam DryAge named). Recovery replays exactly
+     * that prefix of the log and stops: the returned store is the state after those mutations and
+     * nothing later, with every index tier and read surface (order statistics included) built over
+     * it. {@code maxRecords} of zero is the empty store; a bound at or above the log's record count
+     * is identical to {@link #open}. A bounded open always <b>cold-scans</b> — the hint checkpoint
+     * describes the log's FINAL state, so it is bypassed, never trusted for a prefix.
+     *
+     * <p><b>Read-only, like every historical view:</b> the recovered index reflects only the prefix,
+     * but the log file on disk still holds every record. Writing into a bounded store would append
+     * past a tail the index does not know — treat it as history (DryAge's {@code AgedView} does).</p>
+     *
+     * <p><b>Honest bound — compaction collapses history:</b> "record N" counts the records the log
+     * physically holds, in write order. If this store's log was compacted, overwrites and tombstones
+     * were already reclaimed, so N counts the <em>surviving</em> records, not the original mutations.
+     * Faithful mutation-by-mutation replay needs an uncompacted log (a generation preserved before
+     * any compaction).</p>
+     *
+     * @throws IllegalArgumentException if {@code maxRecords} is negative
+     */
+    public static <K, V> SmokeHouse<K, V> openAsOfRecord(Path dir, SmokeHouseOptions<K, V> opts,
+                                                         long maxRecords) throws IOException {
+        if (maxRecords < 0) {
+            throw new IllegalArgumentException("maxRecords must be >= 0: " + maxRecords);
+        }
+        return recover(dir, opts, maxRecords);
+    }
+
+    /**
+     * How many intact records {@code dir}'s log holds — the exclusive upper coordinate for
+     * {@link #openAsOfRecord}. Read-only: it never creates an active segment, so a preserved
+     * generation stays untouched (this is what lets DryAge count a vaulted generation in place).
+     */
+    public static long countRecords(Path dir) throws IOException {
+        Objects.requireNonNull(dir, "dir");
+        return SegmentLog.countRecords(dir);
+    }
+
+    private static <K, V> SmokeHouse<K, V> recover(Path dir, SmokeHouseOptions<K, V> opts,
+                                                   long applyLimit) throws IOException {
         Objects.requireNonNull(dir, "dir");
         Objects.requireNonNull(opts, "opts");
+        boolean bounded = applyLimit >= 0;
         boolean ensembleBacked = opts.tier() == SmokeHouseOptions.IndexTier.ENSEMBLE
                 || opts.tier() == SmokeHouseOptions.IndexTier.EVOLUTION;
         if (ensembleBacked && opts.retention() > 0) {
@@ -277,7 +322,11 @@ public final class SmokeHouse<K, V> implements Closeable {
 
         // ── Recovery: (hint checkpoint +) delta scan → last-writer-wins → sort → O(n) build ──
         HintFile.KeyCodec<K> codec = keyCodec(opts);
-        HintFile.Hint<K> hint = HintFile.load(log.hintPath(), codec, opts.comparator(), log);
+        // A bounded recovery replays a PREFIX of the log; the hint is a checkpoint of the log's
+        // FINAL state, so it must be bypassed — a record-granularity open always cold-scans.
+        HintFile.Hint<K> hint = bounded
+                ? null
+                : HintFile.load(log.hintPath(), codec, opts.comparator(), log);
         // TreeMap, not HashMap: the warm-start-no-delta path below skips the SuperBeefSort re-sort
         // and builds the index straight from live.values(), so that iteration MUST be key-sorted.
         // HashMap order is only accidentally ascending below 2^16 keys — the h ^ (h >>> 16) spread
@@ -293,7 +342,7 @@ public final class SmokeHouse<K, V> implements Closeable {
             recoveredGarbage.putAll(hint.garbage());
             scanFloor = hint.maxCoveredSegmentId();
         }
-        log.scanAbove(scanFloor, (segId, offset, rec) -> {
+        SegmentLog.RecordVisitor visitor = (segId, offset, rec) -> {
             delta[0] = true;
             K key = readKey(opts, rec.key());
             IndexEntry<K> prev;
@@ -306,7 +355,12 @@ public final class SmokeHouse<K, V> implements Closeable {
             if (prev != null) {
                 recoveredGarbage.merge(prev.segmentId(), (long) prev.recordBytes(), Long::sum);
             }
-        });
+        };
+        if (bounded) {
+            log.scanBounded(applyLimit, visitor);          // replay only the requested prefix
+        } else {
+            log.scanAbove(scanFloor, visitor);             // hint delta, or full cold scan
+        }
 
         List<IndexEntry<K>> entries = new ArrayList<>(live.values());
         if (opts.retention() > 0 && entries.size() > opts.retention()) {

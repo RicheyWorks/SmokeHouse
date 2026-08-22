@@ -275,6 +275,78 @@ final class SegmentLog implements Closeable {
     }
 
     /**
+     * Scan at most the first {@code maxRecords} intact records, in write order (oldest segment
+     * first, offset order within) — the prefix a record-granularity recovery replays. A negative
+     * {@code maxRecords} is unbounded (identical to {@link #scan}); zero visits nothing. Stops
+     * across segment boundaries, so a small bound never reads a large tail. Each segment still
+     * stops at its first torn record, exactly as {@link #scanAbove} does.
+     */
+    void scanBounded(long maxRecords, RecordVisitor visitor) throws IOException {
+        if (maxRecords < 0) {
+            scan(visitor);
+            return;
+        }
+        long applied = 0;
+        if (applied >= maxRecords) {
+            return;
+        }
+        for (int id : segmentIds()) {
+            try (DataInputStream in = new DataInputStream(
+                    new BufferedInputStream(Files.newInputStream(segmentPath(id)), 1 << 16))) {
+                long offset = 0;
+                while (true) {
+                    RecordCodec.Rec rec = RecordCodec.decode(in);
+                    if (rec == null || rec.isTorn()) {
+                        break;                            // clean end, or crash tail: truncate here
+                    }
+                    visitor.visit(id, offset, rec);
+                    offset += rec.totalBytes();
+                    if (++applied >= maxRecords) {
+                        return;                           // the requested prefix is complete
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Count the intact records a directory's segments hold, <b>read-only</b> — no active segment
+     * is created (unlike {@link #open}), so a preserved, immutable generation stays byte-for-byte
+     * untouched. Reads the {@code seg-*.log} files directly in id order, stopping each at its first
+     * torn record, so the count equals the number a full recovery would apply and the number
+     * {@link #scanBounded} can bound against. A directory with no segments counts zero.
+     */
+    static long countRecords(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) {
+            return 0;
+        }
+        List<Integer> ids = new ArrayList<>();
+        try (var stream = Files.list(dir)) {
+            stream.forEach(p -> {
+                Matcher m = SEGMENT_NAME.matcher(p.getFileName().toString());
+                if (m.matches()) {
+                    ids.add(Integer.parseInt(m.group(1)));
+                }
+            });
+        }
+        ids.sort(null);
+        long total = 0;
+        for (int id : ids) {
+            try (DataInputStream in = new DataInputStream(
+                    new BufferedInputStream(Files.newInputStream(dir.resolve(segmentName(id))), 1 << 16))) {
+                while (true) {
+                    RecordCodec.Rec rec = RecordCodec.decode(in);
+                    if (rec == null || rec.isTorn()) {
+                        break;
+                    }
+                    total++;
+                }
+            }
+        }
+        return total;
+    }
+
+    /**
      * Scan segments with {@code id > minExclusive} in id order — the hint-checkpoint delta path.
      * Each segment stops at its first torn record (crash tail); everything before a tear is
      * intact by the format's construction.
