@@ -36,6 +36,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -128,6 +129,25 @@ public final class SmokeHouse<K, V> implements Closeable {
     private int pilotCycles;
     private boolean evolutionCycleOpen;                            // pilot-only (store lock)
     private boolean closed;
+    private RecoveryReport recovery;                                // what the last open did (2026-09-02)
+
+    /**
+     * What the last {@link #open} did to stand this store up — engine 2 (SuperBeefSort) is the
+     * recovery engine, and until 2026-09-02 nothing it measured survived construction: the
+     * {@link DataProfile} and the sort metrics primed the control plane and were dropped. A
+     * warm start with no delta past the hint skips the sort ({@code sorted == false}, the
+     * strategy fields empty); a cold scan, or a delta, sorts, and the report says by which
+     * strategy, at what cost, over how disordered a feed, and which tree the index was born as.
+     */
+    public record RecoveryReport(int entries, boolean hintUsed, boolean bounded, boolean sorted,
+                                 String sortStrategy, long comparisons, long moves, double sortMillis,
+                                 double sortednessRatio, long inversions, boolean nearlySorted,
+                                 String bornStrategy, String tier) { }
+
+    /** The report of the open that stood this store up; never null. */
+    public RecoveryReport recovery() {
+        return recovery;
+    }
 
     private SmokeHouse(SmokeHouseOptions<K, V> opts, SegmentLog log, OrderedSet<IndexEntry<K>> index,
                        WorkloadAdaptation<IndexEntry<K>> adaptation,
@@ -327,11 +347,17 @@ public final class SmokeHouse<K, V> implements Closeable {
         HintFile.Hint<K> hint = bounded
                 ? null
                 : HintFile.load(log.hintPath(), codec, opts.comparator(), log);
-        // TreeMap, not HashMap: the warm-start-no-delta path below skips the SuperBeefSort re-sort
-        // and builds the index straight from live.values(), so that iteration MUST be key-sorted.
-        // HashMap order is only accidentally ascending below 2^16 keys — the h ^ (h >>> 16) spread
-        // perturbs bucket order above it, so fromSorted saw an unsorted list and threw.
-        Map<K, IndexEntry<K>> live = new TreeMap<>(opts.comparator());
+        // LinkedHashMap, in ARRIVAL order (2026-09-02). This was a TreeMap keyed by the comparator,
+        // which handed SuperBeefSort an already-sorted feed on every open: the recovery engine's
+        // profile read sortedness 1.0 and zero inversions whatever the data had done, its "sort"
+        // was an n-1 comparison insertion pass, and the born strategy was advised from a profile
+        // that described the TreeMap, not the workload. The first recovery report (RecoveryReport)
+        // said so. Now the hint's entries come first, in the key order the hint wrote them, and the
+        // delta appends in log order; a warm start with no delta is therefore still key-sorted
+        // (the reason the TreeMap was chosen -- HashMap order is only accidentally ascending below
+        // 2^16 keys), and any open that scans records hands the sort the disorder it actually
+        // found and lets engine 2 measure it and sort it.
+        Map<K, IndexEntry<K>> live = new LinkedHashMap<>();
         Map<Integer, Long> recoveredGarbage = new HashMap<>();
         boolean[] delta = {false};
         int scanFloor = Integer.MIN_VALUE;
@@ -389,6 +415,24 @@ public final class SmokeHouse<K, V> implements Closeable {
             profile = run.profile();
             sortMetrics = run.sortMetrics();
         }
+        SmokeHouse<K, V> store = build(opts, log, entries, profile, sortMetrics, ordering, recoveredGarbage);
+        store.recovery = new RecoveryReport(entries.size(), hint != null, bounded, sortMetrics != null,
+                sortMetrics != null ? String.valueOf(sortMetrics.strategyId()) : "",
+                sortMetrics != null ? sortMetrics.comparisons() : 0,
+                sortMetrics != null ? sortMetrics.moves() : 0,
+                sortMetrics != null ? sortMetrics.elapsedMillis() : 0.0,
+                profile != null ? profile.sortednessRatio() : -1.0,
+                profile != null ? profile.inversions() : -1L,
+                profile != null && profile.nearlySorted(),
+                store.bornStrategyName(), String.valueOf(opts.tier()));
+        return store;
+    }
+
+    /** The index, built from the recovered, sorted entries by tier. */
+    private static <K, V> SmokeHouse<K, V> build(SmokeHouseOptions<K, V> opts, SegmentLog log,
+                                                 List<IndexEntry<K>> entries, DataProfile profile,
+                                                 SortResult sortMetrics, Comparator<IndexEntry<K>> ordering,
+                                                 Map<Integer, Long> recoveredGarbage) throws IOException {
 
         if (opts.tier() == SmokeHouseOptions.IndexTier.ENSEMBLE) {
             // The mirrored morph-family trio (RB + AVL + Splay): adaptation is an O(1) primary
@@ -432,6 +476,39 @@ public final class SmokeHouse<K, V> implements Closeable {
             adaptation.recordFeed(feedTail(entries));   // the feed WAS the recent workload
         }
         return new SmokeHouse<>(opts, log, index, adaptation, null, null, null, recoveredGarbage);
+    }
+
+    /** The simple name of the tree the index was built as (the ensemble's primary for ensemble tiers). */
+    private String bornStrategyName() {
+        if (ensemble != null) {
+            return "ensemble(" + ensemble.primary().strategyName() + ")";
+        }
+        return index.getStrategy().getClass().getSimpleName();
+    }
+
+    /**
+     * Release this store's handles WITHOUT the checkpoint a clean {@link #close()} writes — what the
+     * process dying after its last append looks like to the next {@link #open}, made callable so a
+     * recovery drill can walk the road every real crash takes: the log scan, the SuperBeefSort
+     * re-sort, the born strategy (2026-09-02). Whatever hint an earlier clean close left stays, as
+     * it would; the delta since it is what the next open must scan and sort. Idempotent with close.
+     */
+    public void abandon() throws IOException {
+        if (pilot != null) {
+            pilot.shutdownNow();
+        }
+        synchronized (lock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            tailStream.close();
+            log.force();                                              // the appends are durable; the checkpoint is not
+            log.close();
+            if (ensemble != null) {
+                ensemble.close();
+            }
+        }
     }
 
     /**

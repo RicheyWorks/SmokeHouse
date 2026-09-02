@@ -406,6 +406,13 @@ public final class IndexedStore<K, V> implements Closeable {
         }
     }
 
+    /** {@link SmokeHouse#abandon()} through the fan-out: the primary dies without its checkpoint. */
+    public void abandon() throws IOException {
+        synchronized (lock) {
+            store.abandon();
+        }
+    }
+
     // ── Internals ─────────────────────────────────────────────────────────────────────────────
 
     /** One named plain secondary: the composite-entry set plus how to derive entries from values. */
