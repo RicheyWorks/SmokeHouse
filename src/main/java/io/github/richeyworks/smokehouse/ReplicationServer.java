@@ -11,6 +11,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.UnaryOperator;
 
 /**
  * Phase 8 (D3 option A): the primary's side of the replication ring. Serves any number of
@@ -35,6 +37,12 @@ import java.util.List;
  * Keys and values cross the wire through the store's own {@code SpillSerializer}s — the
  * framing the outer-ring ADR promised to reuse.</p>
  *
+ * <p>The feed seam (2026-09-02): {@link #serve(SmokeHouse, SmokeHouseOptions, UnaryOperator)}
+ * takes a wrapper applied to each client's tail listener before it is subscribed — the one
+ * place a caller can slow the replication feed itself (a {@code Sizzle.slow} wrapper holds a
+ * replica behind its primary for real, so a fleet's lag reading can be shown to be a reading).
+ * The default is identity; the wrapper sees frames, never the store.</p>
+ *
  * <p>Loopback-only, as tradition demands.</p>
  */
 public final class ReplicationServer<K, V> implements Closeable {
@@ -48,13 +56,15 @@ public final class ReplicationServer<K, V> implements Closeable {
     private final ServerSocket server;
     private final Thread acceptor;
     private final List<AutoCloseable> perClient = new ArrayList<>();
+    private final UnaryOperator<TailListener<K, V>> feed;
     private volatile boolean closed;
 
     private ReplicationServer(SmokeHouse<K, V> store, SmokeHouseOptions<K, V> opts,
-                              ServerSocket server) {
+                              ServerSocket server, UnaryOperator<TailListener<K, V>> feed) {
         this.store = store;
         this.opts = opts;
         this.server = server;
+        this.feed = feed;
         this.acceptor = new Thread(this::acceptLoop, "smokehouse-repl-acceptor");
         this.acceptor.setDaemon(true);
     }
@@ -63,8 +73,22 @@ public final class ReplicationServer<K, V> implements Closeable {
     public static <K, V> ReplicationServer<K, V> serve(SmokeHouse<K, V> store,
                                                        SmokeHouseOptions<K, V> opts)
             throws IOException {
+        return serve(store, opts, UnaryOperator.identity());
+    }
+
+    /**
+     * Serve {@code store}, wrapping each client's feed listener with {@code feed} before it is
+     * subscribed to the tail. The wrapper runs on the tail subscriber's thread, so whatever it
+     * does (sleep, count, drop nothing) is what the replica experiences; {@code onGap} must
+     * still pass through, or a gapped replica never learns it gapped.
+     */
+    public static <K, V> ReplicationServer<K, V> serve(SmokeHouse<K, V> store,
+                                                       SmokeHouseOptions<K, V> opts,
+                                                       UnaryOperator<TailListener<K, V>> feed)
+            throws IOException {
+        Objects.requireNonNull(feed, "feed");
         ServerSocket server = new ServerSocket(0, 8, InetAddress.getLoopbackAddress());
-        ReplicationServer<K, V> rs = new ReplicationServer<>(store, opts, server);
+        ReplicationServer<K, V> rs = new ReplicationServer<>(store, opts, server, feed);
         rs.acceptor.start();
         return rs;
     }
@@ -94,7 +118,8 @@ public final class ReplicationServer<K, V> implements Closeable {
                     new BufferedOutputStream(socket.getOutputStream(), 1 << 16));
             FrameWriter writer = new FrameWriter(out);
             long seq0 = store.tailSequence();                  // frames stream from here on
-            AutoCloseable sub = store.tail(seq0, writer);
+            AutoCloseable sub = store.tail(seq0, Objects.requireNonNull(feed.apply(writer),
+                    "feed wrapper returned null"));
             synchronized (perClient) {
                 perClient.add(sub);
                 perClient.add(socket);

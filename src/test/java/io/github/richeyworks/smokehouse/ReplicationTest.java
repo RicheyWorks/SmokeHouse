@@ -14,6 +14,7 @@ import java.net.Socket;
 import java.nio.file.Path;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -82,6 +83,48 @@ class ReplicationTest {
                 assertEquals(oracle, scan(replica.store()), "post-churn state");
                 assertEquals(0, replica.lagSequence(), "caught up means zero lag");
             }
+        }
+    }
+
+    @Test
+    void theFeedSeamHoldsAReplicaBehindItsPrimaryAndItStillConverges(@TempDir Path primaryDir,
+                                                                      @TempDir Path replicaDir)
+            throws IOException {
+        // The feed seam (2026-09-02): a wrapper around each client's tail listener. Slowing it
+        // is the honest way to hold a replica behind -- the frames genuinely arrive late -- so
+        // a lag reading can be shown to be a reading and not a constant. onGap is not exercised
+        // here (the ring is far bigger than the churn); the wrapper counts what it forwarded.
+        AtomicLong forwarded = new AtomicLong();
+        TreeMap<Long, String> oracle = new TreeMap<>();
+        try (SmokeHouse<Long, String> primary = SmokeHouse.open(primaryDir, opts());
+             ReplicationServer<Long, String> server = ReplicationServer.serve(primary, opts(),
+                     inner -> new TailListener<Long, String>() {
+                         @Override
+                         public void onEvent(TailEvent<Long, String> event) {
+                             try {
+                                 Thread.sleep(40);
+                             } catch (InterruptedException e) {
+                                 Thread.currentThread().interrupt();
+                             }
+                             forwarded.incrementAndGet();
+                             inner.onEvent(event);
+                         }
+
+                         @Override
+                         public void onGap() {
+                             inner.onGap();
+                         }
+                     });
+             Replica<Long, String> replica = Replica.connect(replicaDir, opts(), server.port())) {
+            assertTrue(replica.awaitCaughtUp(primary.tailSequence(), AWAIT));
+            churn(primary, oracle, new Random(5), 25);         // ~1 s of held-back frames
+            long target = primary.tailSequence();
+            assertTrue(replica.lagSequence() > 0 || replica.appliedSequence() < target - 1,
+                    "with a 40 ms feed the replica is behind right after 25 writes");
+            assertTrue(replica.awaitCaughtUp(target, AWAIT), "and it still converges");
+            assertEquals(0, replica.lagSequence());
+            assertEquals(25, forwarded.get(), "every frame went through the wrapper");
+            assertEquals(scan(primary), scan(replica.store()));
         }
     }
 
